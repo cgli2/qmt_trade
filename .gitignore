@@ -1,0 +1,51 @@
+# Python bytecode and tool caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Runtime data, logs, reports, and local configuration
+data/
+logs/
+reports/
+config/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+
+# Frontend dependencies and build output
+webui/node_modules/
+webui/dist/
+webui/.vite/
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local assistant/tooling workspaces
+.harness/
+.harness-memory/
+.workbuddy/
+.verify_tmp/
+.publish-qmt_trade/
+
+# Local environment/secrets (never commit)
+.env
+.env.*
+!.env.example
+
+# Miscellaneous local files
+nul
