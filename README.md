@@ -1,7 +1,7 @@
 # my_qmt_trade — LLM 驱动的 A 股全自动交易系统
 
 基于 LLM 多智能体研判 + 规则化风控/仓位/执行的 A 股自动交易系统。设计目标：**高胜率、可回放、失败安全**。
-提供 **WebUI + REST API**（推荐）与 **CLI** 两套操作界面，支持 sim / paper / live 三种模式。
+提供 **WebUI + REST API**（推荐）与 **CLI** 两套操作界面，支持 `paper`（真数据模拟盘，默认）与 `live`（实盘）两种运行模式；WebUI 另保留 `sim` 演示模式（固定走 Mock 数据，仅供机制演示，严禁用于回测/真实决策）。
 
 完整设计见 [`docs/系统设计文档-全文.md`](docs/系统设计文档-全文.md)，
 部署与日常运维见 [`docs/部署与使用说明.md`](docs/部署与使用说明.md)。
@@ -137,11 +137,14 @@ DINGTALK_WEBHOOK=https://oapi.dingtalk.com/...
 
 | 模式 | 含义 | 是否真实下单 |
 |---|---|---|
-| `sim` | 全模拟（Mock 数据 + SimGateway，开发自测） | 否 |
 | `paper` | 真实行情 + 模拟撮合（真数据模拟盘，默认） | 否 |
 | `live` | 实盘（接 QMT 网关，仅 Windows） | **是，需显式指定** |
 
-三种模式共用同一套决策/风控/执行代码。**决策产物跨模式共享**（统一存 `data/trade.db`），
+> `sim` 已不再是运行模式：CLI 的 `--mode` 仅接受 `paper` / `live`（见 §4.3）；
+> WebUI 界面保留的 sim 模式固定走 MockProvider（虚拟标的 + 随机行情），只用于机制演示，
+> **严禁**用于回测与真实决策（回测命令会硬性拒绝 Mock 数据）。
+
+两种模式共用同一套决策/风控/执行代码。**决策产物跨模式共享**（统一存 `data/trade.db`），
 账本按模式隔离（live 单独用 `data/trade_live.db`）。
 
 ### 4.2 WebUI + 后端服务（推荐，日常就用它）
@@ -171,7 +174,7 @@ bash scripts/watchdog_backend.sh    # 每 30s 健康检查，掉线约 1 分钟�
 
 ```bash
 # 1) 先看调度日程（不真正跑，验证装配是否 OK）
-python -m qmt_trade --mode sim run --plan-only
+python -m qmt_trade --mode paper run --plan-only
 
 # 2) 起调度器，按 config/settings.yaml 的日程自动跑（Ctrl-C 退出）
 python -m qmt_trade --mode paper run
@@ -180,13 +183,13 @@ python -m qmt_trade --mode paper run
 python -m qmt_trade --mode paper run --once selection
 
 # 4) 把某天整套流程跑一遍（replay）
-python -m qmt_trade --mode sim run --replay 2026-08-07
+python -m qmt_trade --mode paper run --replay 2026-08-07
 
 # 5) 实盘（务必确认 QMT 已连接、账号已配置）
 python -m qmt_trade --mode live run
 ```
 
-### 4.4 Docker（sim / paper）
+### 4.4 Docker（paper）
 
 ```bash
 docker compose up -d --build      # 一键构建并后台启动，访问 http://localhost:7099
@@ -209,7 +212,9 @@ docker compose up -d --build      # 一键构建并后台启动，访问 http://
 | 实盘 | live 模式的持仓/委托/计划与下单执行 |
 | 回测 | 历史区间回测（与实盘同一执行链路） |
 | 风控 | 三闸门事件、KillSwitch 操作 |
-| 事件 / 报告 / 策略 | 新闻事件库、日报周报、策略池权重与进化、独立策略实验室（打板/二板/低吸/趋势/ETF T+0 日内回转）启停与回测 |
+| 事件 / 报告 | 新闻事件库、日报周报 |
+| 策略 | 策略池权重与进化、独立策略实验室（打板/二板/低吸/趋势/尾盘选股/ETF T+0 日内回转）启停与回测 |
+| 通知 | 通知渠道配置与推送记录 |
 | LLM / 设置 | LLM 用量与模型状态、settings.yaml / llm.yaml 在线编辑、数据源健康度 |
 
 **日常节奏**（默认日程见 `config/settings.yaml` 的 `scheduler.jobs`）：
@@ -262,6 +267,7 @@ docker compose up -d --build      # 一键构建并后台启动，访问 http://
 | 表 | 作用 | 关键字段 |
 |---|---|---|
 | `intents` | LLM 产出的交易意图 | trade_date, symbol, action, confidence, conviction, payload(JSON), trace_id |
+| `daily_picks` | 盘前选股/研判精选结果（当日 (trade_date, symbol) 唯一） | trade_date, symbol, rank, action, conviction, confidence, intent_id, payload(JSON), bull_case, bear_case, debate, evidence |
 | `plans` | 意图经风控+仓位后的可执行计划 | intent_id, side, planned_shares, stop_loss_price, take_profit, status |
 | `orders` | 订单（**幂等键防重复下单**） | idempotency_key(UNIQUE), symbol, side, price, volume, status, reject_reason |
 | `trades` | 成交流水 | price, volume, amount, commission, stamp_duty, slippage_cost, realized_pnl |
@@ -272,6 +278,7 @@ docker compose up -d --build      # 一键构建并后台启动，访问 http://
 | `experiences` | 复盘经验库（供后续决策检索） | situation, action, outcome, pnl_pct, lesson, embedding |
 | `system_state` | KillSwitch 等系统状态（持久化，重启不丢） | key(PK), value, reason, updated_at |
 | `reconcile_logs` | 盘后对账日志 | trade_date, passed, detail |
+| `job_runs` | 调度任务运行记录 | job_name, trade_date, status(OK/FAIL/SKIP), reason, elapsed, started_at |
 | `news` | 新闻与事件 | symbol, title, publish_time, category, sentiment, importance |
 
 全链路（意图→计划→订单→成交→风控→LLM 调用）用 `trace_id` 串联，可全程审计（P6）。
@@ -302,9 +309,10 @@ my_qmt_trade/
 ├── config/
 │   ├── settings.yaml          # 非敏感配置（入库）
 │   ├── llm.yaml               # LLM 独立管理：多平台/多模型/场景智能选模（入库）
+│   ├── strategies/            # 独立策略（尾盘选股/打板/二板/低吸/趋势/ETF T+0）配置
 │   └── .env                   # 敏感配置（自建，不入库）
 ├── data/
-│   ├── trade.db               # SQLite 主库（决策产物 + sim/paper 账本，自动建表）
+│   ├── trade.db               # SQLite 主库（决策产物 + paper 账本，自动建表）
 │   ├── trade_live.db          # live 实盘账本（按模式隔离）
 │   ├── llm_cache.db           # LLM 响应缓存
 │   └── parquet/               # 行情/财务 PIT 缓存
@@ -323,10 +331,10 @@ my_qmt_trade/
 ├── server/                    # FastAPI 后端（/api JSON 接口 + 常驻调度器 + SPA 托管）
 ├── webui/                     # Vue3 + Vite 前端（构建产物 webui/dist 由后端托管）
 ├── scripts/                   # start_backend.sh / watchdog_backend.sh / autostart_backend.bat
-├── docs/                      # 设计文档（01 / _part2~4 / 全文）+ 部署与使用说明
-├── tests/                     # 冒烟测试（smoke_*.py，14 个文件 / 700 项断言）
+├── docs/                      # 设计文档（01-系统设计文档 / 系统设计文档-全文）+ 部署与使用说明
+├── tests/                     # 冒烟测试（smoke_*.py，15 个文件 / 约 700 项断言）
 ├── reports/                   # 生成的日报/周报
-├── Dockerfile  docker-compose.yml   # 容器化部署（sim/paper）
+├── Dockerfile  docker-compose.yml   # 容器化部署（paper）
 └── requirements.txt           # Python 依赖
 ```
 
@@ -335,11 +343,11 @@ my_qmt_trade/
 ## 9. 自检与测试
 
 ```bash
-# 冒烟测试（14 个文件，约 700 项断言），逐个运行即可
+# 冒烟测试（15 个文件，约 700 项断言），逐个运行即可
 python tests/smoke_llm_adapter.py     # LLM 独立管理层 + 场景智能选模 + P5 降级闭环
 python tests/smoke_scheduler.py       # 调度层 + 失败安全 + 补跑
 python tests/smoke_webui_api.py       # WebUI API 接口
-# ... 其余 tests/smoke_*.py 同理（datahub/features/selection/brain/risk/gateway/backtest/evolution/ops/reconcile/reflection/strategy）
+# ... 其余 tests/smoke_*.py 同理（datahub/features/selection/brain/gateway/backtest/evolution/ops/reconcile/reflection/strategy/stock_t0）
 ```
 
 覆盖数据、特征、选股、研判、风控、仓位、执行、回测、进化、运维、调度、LLM、WebUI 各层，
