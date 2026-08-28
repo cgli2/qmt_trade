@@ -15,14 +15,19 @@ env/
 ENV/
 
 # Runtime data, logs, reports, and local configuration
-data/
-logs/
-reports/
+# Keep the directories in Git via their .gitkeep placeholders; ignore contents.
+data/*
+!data/.gitkeep
+logs/*
+!logs/.gitkeep
+reports/*
+!reports/.gitkeep
 config/
 *.log
 *.sqlite
 *.sqlite3
 *.db
+*.zip
 
 # Frontend dependencies and build output
 webui/node_modules/

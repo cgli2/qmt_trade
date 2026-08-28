@@ -1,0 +1,14 @@
+# my_qmt_trade 后端依赖（Python 3.11+）
+# 说明：
+# - live 实盘网关依赖 xtquant（仅 Windows，随 QMT 客户端安装），无法 pip 安装，
+#   故不列入本文件；paper/sim 模式无此依赖。
+pandas>=2.0
+numpy>=1.24
+pyyaml>=6.0
+pydantic>=2.0
+requests>=2.31
+apscheduler>=3.10      # 可选：不装则调度器退化为内置轮询，功能不受影响
+
+# Web API 服务（server/）
+fastapi>=0.110
+uvicorn[standard]>=0.29

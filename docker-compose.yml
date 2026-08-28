@@ -1,0 +1,27 @@
+# 一键启动（paper 模拟盘）：
+#   docker compose up -d --build
+#   浏览器访问 http://localhost:7099
+#
+# 敏感配置（API Key）二选一：
+#   1. 项目根放 .env（内容同 config/.env 格式），compose 自动注入环境变量
+#   2. 或直接把 config/.env 挂载进容器（应用自身会加载它）
+services:
+  qmt-trade:
+    build: .
+    image: qmt-trade:latest
+    container_name: qmt-trade
+    ports:
+      - "7099:7099"
+    volumes:
+      # 账本/行情缓存/报告持久化：容器重建不丢数据
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./reports:/app/reports
+      # 覆盖配置（可选）：改调度时刻/风控参数无需重建镜像
+      # - ./config/settings.yaml:/app/config/settings.yaml:ro
+      # - ./config/llm.yaml:/app/config/llm.yaml:ro
+    env_file:
+      # 存在才生效；示例内容见 docs/部署与使用说明.md §3.2
+      - path: .env
+        required: false
+    restart: unless-stopped
