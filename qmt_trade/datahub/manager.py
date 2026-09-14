@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -105,6 +106,12 @@ class DataHub:
         self.max_abs_return = float(quality.get("max_abs_return", 0.35))
         self._instrument_cache: dict[str, InstrumentInfo] = {}
         self._instrument_missing: set[str] = set()
+        # 全量标的池(universe)TTL 缓存：/market/symbols 等每次点 tab 都会空参请求全市场
+        # 标的（akshare 全量快照 / QMT 逐只 detail，1~5s+），而标的名单日内极稳定。
+        # 仅实盘模式(asof is None)缓存；回测(asof 有值)必须走 PIT，绝不复用，避免前视偏差。
+        self._universe_cache: list[InstrumentInfo] | None = None
+        self._universe_cache_at: float = 0.0
+        self.universe_ttl = float(cache_cfg.get("universe_ttl", 1800))
 
         for p in providers or ():
             self.register(p)
@@ -531,7 +538,16 @@ class DataHub:
     # ------------------------------------------------------------ 基础信息
     def get_instruments(self, symbols: Sequence[str] | None = None) -> list[InstrumentInfo]:
         syms = _sym_list(symbols)
-        if syms and all(s in self._instrument_cache for s in syms):
+        # 全量标的池请求（空参）在实盘模式(asof is None)下走 TTL 缓存：/market/symbols
+        # 每次点 tab 都会空参拉全市场（akshare 全量快照 / QMT 逐只 detail，1~5s+），
+        # 而标的名单日内极稳定，缓存后重复请求近乎瞬时。
+        # 回测/复现(asof 有值)绝不缓存：标的名单随 asof 变化，复用会引入前视偏差。
+        use_universe_cache = not syms and self.asof is None and self.universe_ttl > 0
+        if use_universe_cache:
+            if (self._universe_cache is not None
+                    and (time.time() - self._universe_cache_at) < self.universe_ttl):
+                return self._universe_cache
+        elif syms and all(s in self._instrument_cache for s in syms):
             return [self._instrument_cache[s] for s in syms]
         infos = self._dispatch(
             "instruments",
@@ -544,6 +560,10 @@ class DataHub:
         )
         for info in infos:
             self._instrument_cache[info.symbol] = info
+        # 只缓存非空的全量结果：源临时故障返回空时不写，避免把空名单锁定一个 TTL 周期。
+        if use_universe_cache and infos:
+            self._universe_cache = infos
+            self._universe_cache_at = time.time()
         return infos
 
     def get_instrument(self, symbol: str) -> InstrumentInfo | None:

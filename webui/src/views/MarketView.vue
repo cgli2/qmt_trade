@@ -68,6 +68,21 @@ function defaultStartFor(p: string) {
 
 const pickedInfo = computed(() => symbols.value.find((s) => s.symbol === picked.value));
 
+// 代码 -> 标的画像（含真实名称），供推荐列表补充名称
+const symbolMap = computed(() => {
+  const m: Record<string, any> = {};
+  for (const s of symbols.value) m[s.symbol] = s;
+  return m;
+});
+
+// 推荐项展示名：优先真实名称；拿不到名称时不回退到"未知"，宁可留空
+function pickLabel(p: any): string {
+  const nm = String(symbolMap.value[p.symbol]?.name || "").trim();
+  if (nm && nm !== "未知") return nm;
+  const ind = String(p.industry || "").trim();
+  return ind === "未知" ? "" : ind;
+}
+
 async function loadSymbols() {
   const r = await tryReq(() => api.symbols(app.mode));
   symbols.value = r?.symbols || [];
@@ -323,7 +338,7 @@ watch([pageTab, tab, picked], () => {
             >
               <span class="rk">#{{ p.rank }}</span>
               <span class="ps">{{ p.symbol }}</span>
-              <span class="pn">{{ p.industry || "" }}</span>
+              <span class="pn">{{ pickLabel(p) }}</span>
               <span class="psc">{{ Number(p.score).toFixed(3) }}</span>
             </button>
           </div>

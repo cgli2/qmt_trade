@@ -25,6 +25,8 @@ const intents = ref<any[]>([]);
 const broker = ref<any>(null);
 const recon = ref<any>(null);
 const symbols = ref<any[]>([]);
+const symbolsLoading = ref(false);
+let symbolsInflight: Promise<void> | null = null;
 const dateFilter = ref("");
 const orderDlg = ref<any>(null);
 const orderResult = ref<any>(null);
@@ -46,34 +48,35 @@ async function load() {
 async function loadPaper() {
   const generation = ++requestGeneration;
   loading.value = true;
-  const [p, o, i, s] = await Promise.all([
+  // 注意：不在这里拉全量标的(symbols)——它只被「手动下单」弹窗用到，
+  // 放进 Promise.all 会让每次切 tab 都阻塞在全市场标的请求上（1~5s）。
+  // 标的改为弹窗打开时懒加载(ensureSymbols)，tab 内容即刻渲染。
+  const [p, o, i] = await Promise.all([
     tryReq(() => api.positions("paper")),
     tryReq(() => api.orders("paper", dateFilter.value || undefined)),
     tryReq(() => api.intents("paper", dateFilter.value || undefined)),
-    tryReq(() => api.symbols("paper")),
   ]);
   if (generation !== requestGeneration) return;
   positions.value = p?.positions || [];
   orders.value = sortOrders(o?.orders || []);
   intents.value = i?.intents || [];
-  symbols.value = s?.symbols || [];
   loading.value = false;
 }
 
 async function loadLive() {
   const generation = ++requestGeneration;
   loading.value = true;
-  const [b, o, s] = await Promise.all([
+  // 同 loadPaper：全量标的(symbols)移出关键路径，改为下单弹窗懒加载，
+  // 避免切到实盘 tab 时既要等券商探测、又要等全市场标的。
+  const [b, o] = await Promise.all([
     // QMT 未连接时网关会重试连接（约 30s+），超时兜底避免页面一直转圈
     withTimeout(tryReq(() => api.broker("live")), 40000,
       { available: false, message: "券商查询超时：请确认 QMT 客户端已登录（连接重试中，可稍后刷新）" }),
     tryReq(() => api.orders("live", dateFilter.value || undefined)),
-    tryReq(() => api.symbols("live")),
   ]);
   if (generation !== requestGeneration) return;
   broker.value = b || { available: false, message: "券商信息加载失败" };
   orders.value = sortOrders(o?.orders || []);
-  symbols.value = s?.symbols || [];
   loading.value = false;
 }
 
@@ -104,9 +107,28 @@ async function ackRecon() {
   if (r) loadRecon();
 }
 
-function openOrder() {
+// 全量标的仅「手动下单」弹窗的 SymbolSelect 需要，故懒加载 + 组件级缓存：
+// 单实例组件跨 paper/live tab 复用同一份标的（universe 与模式无关），整个会话只拉一次。
+async function ensureSymbols(): Promise<void> {
+  if (symbols.value.length) return;              // 已加载
+  if (symbolsInflight) return symbolsInflight;   // 进行中：复用同一 Promise，避免并发重复请求
+  symbolsLoading.value = true;
+  symbolsInflight = (async () => {
+    try {
+      const s = await tryReq(() => api.symbols(props.mode));
+      symbols.value = s?.symbols || [];
+    } finally {
+      symbolsLoading.value = false;
+      symbolsInflight = null;
+    }
+  })();
+  return symbolsInflight;
+}
+
+async function openOrder() {
   orderDlg.value = { symbol: "", action: "BUY", shares: 0, price: null, confidence: 0.6, conviction: "MEDIUM", stop_loss_type: "percent", stop_loss_value: 0.05, reason: "" };
   orderResult.value = null;
+  await ensureSymbols();   // 弹窗已即时打开，标的列表随后填充（后端 TTL 缓存，通常已就绪）
 }
 
 async function submitOrder() {
@@ -167,7 +189,7 @@ function killBadge(mode?: string) {
   return "danger";
 }
 
-onMounted(load);
+onMounted(() => { load(); ensureSymbols(); });   // ensureSymbols 后台预热标的，不阻塞 tab 渲染
 watch(() => props.mode, () => { recon.value = null; symbolDlg.value = null; load(); });
 </script>
 
@@ -358,7 +380,7 @@ watch(() => props.mode, () => { recon.value = null; symbolDlg.value = null; load
     <Modal v-if="orderDlg" :title="isLive ? '手动实盘下单（真实资金 · 走完整风控链路）' : '手动模拟下单（走完整风控链路）'" @close="orderDlg = null">
       <div class="row">
         <div class="field" style="flex:2"><label>标的 *</label>
-          <SymbolSelect v-model="orderDlg.symbol" :options="symbols" placeholder="搜索 5500+ 标的" />
+          <SymbolSelect v-model="orderDlg.symbol" :options="symbols" :placeholder="symbolsLoading ? '标的列表加载中…' : '搜索 5500+ 标的'" />
         </div>
         <div class="field"><label>动作</label>
           <select v-model="orderDlg.action"><option>BUY</option><option>SELL</option></select>
