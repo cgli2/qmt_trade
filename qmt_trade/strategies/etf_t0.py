@@ -217,6 +217,8 @@ class ETFT0Backtester:
               "days_traded": 0, "day_pnl": []}
         base_done = False
         for i, d in enumerate(days):
+            if getattr(self, "progress_callback", None):
+                self.progress_callback(days.index(d), len(days))
             if i + 1 < len(days):
                 self.portfolio.mark_t1(days[i + 1])
             if not base_done:
@@ -230,6 +232,7 @@ class ETFT0Backtester:
             last = self._last_prices(d)
             self.portfolio.refresh(last)
             self.portfolio.record_equity(day_end=True)
+            result.equity_dates.append(d.isoformat())
             result.equity_curve.append(round(self.portfolio.total_asset, 2))
 
         result.trades = list(self.fills)

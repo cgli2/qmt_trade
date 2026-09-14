@@ -184,3 +184,20 @@ select.mode { width: auto; padding: 6px 10px; }
 .theme-toggle { width: 38px; padding: 6px; }
 .loading { opacity: .55; pointer-events: none; }
 .pill { font-variant-numeric: tabular-nums; }
+
+:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
+.main { min-width: 0; }
+.row > * { min-width: 0; }
+@media (max-width: 760px) {
+  .layout { display: block; height: auto; min-height: 100vh; }
+  .sidebar { width: 100%; height: auto; position: static; display: flex; flex-wrap: wrap; padding: 8px; }
+  .sidebar .brand, .sidebar .nav-group-title { display: none; }
+  .sidebar .nav-item { flex: 1 1 30%; margin: 0; padding: 8px; }
+  .topbar { height: auto; flex-wrap: wrap; gap: 8px; padding: 12px; }
+  .topbar h1 { flex: 1 0 100%; }
+  .content { padding: 10px; }
+  .grid.cols-2, .grid.cols-3, .grid.cols-4 { grid-template-columns: 1fr; }
+  .row { flex-wrap: wrap; }
+  .row > label { flex: 1 1 160px; }
+  .card { padding: 12px; }
+}

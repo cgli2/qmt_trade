@@ -53,7 +53,8 @@ def make_ctx(mode: str = "paper"):
     从持久化状态重新恢复一遍，恢复原因（带「重启恢复：」前缀）与落库原因不同，
     紧跟着的健康检查一拉闸就触发变更回调；前端一轮询，CRITICAL 告警就按分钟刷屏。
     """
-    mode = (mode or "paper").strip().lower()
+    if mode not in ("paper", "live"):
+        raise ValueError("mode must be paper or live")
     if mode == "live" and not _live_allowed():
         raise LiveModeLockedError(
             "观察期已锁死 live 模式。确认虚拟盘观察期结束后，"
@@ -75,25 +76,9 @@ def reset_ctx_cache() -> None:
         _CTX_CACHE.clear()
 
 
-#: live 锁死时自动降级为 paper 的模式清单。
-RESEARCH_FALLBACK_MODES = frozenset({"live"})
-
-
 def make_ctx_research(mode: str = "paper"):
-    """研究类场景（选股/研判/观察清单等）的上下文入口：live 被锁时自动降级 paper。
-
-    选股/研判产物走 shared_repos 共享账本（跨模式共享），不接单不下单，
-    页面停留在 live 档时不应被观察期护栏拦死；**下单类接口严禁用本函数**。
-    """
-    try:
-        return make_ctx(mode)
-    except LiveModeLockedError:
-        if (mode or "").strip().lower() not in RESEARCH_FALLBACK_MODES:
-            raise
-        import logging
-        logging.getLogger(__name__).info(
-            "live 模式处于观察期锁定状态，研究类请求自动降级为 paper")
-        return make_ctx("paper")
+    """保留明确的账户/实例模式，禁止静默改写。共享行情回测直接使用研究服务。"""
+    return make_ctx(mode)
 
 
 _CTX_CACHE: dict[str, Any] = {}
@@ -113,48 +98,93 @@ class Job:
     error: str | None = None
 
 
-JOBS: dict[str, Job] = {}
-_JOBS_LOCK = threading.Lock()
+_JOB_REPOSITORY = None
+_BACKTEST_SERVICE = None
+_JOBS_LOCK = threading.RLock()
+
+
+def job_repository():
+    global _JOB_REPOSITORY
+    from qmt_trade.storage.db import Database
+    from qmt_trade.storage.jobs import JobRepository
+    from qmt_trade.storage.runtime import runtime_path
+    with _JOBS_LOCK:
+        if _JOB_REPOSITORY is None:
+            _JOB_REPOSITORY = JobRepository(Database(runtime_path(), schema="jobs"))
+        return _JOB_REPOSITORY
+
+
+def backtest_service():
+    global _BACKTEST_SERVICE
+    from qmt_trade.backtest.service import BacktestService
+    with _JOBS_LOCK:
+        if _BACKTEST_SERVICE is None:
+            _BACKTEST_SERVICE = BacktestService(job_repository(), lambda: make_ctx("paper"))
+        return _BACKTEST_SERVICE
+
+
+def _legacy_job(row, include_result=True):
+    if not row:
+        return None
+    status = {"queued": "pending", "succeeded": "done", "failed": "error",
+              "cancelled": "error", "interrupted": "error"}.get(row["status"], row["status"])
+    return Job(id=row["id"], kind=row["kind"], status=status,
+               progress=row["stage"] or "", created=row["created"], finished=row["finished"],
+               result=job_repository().report(row["report_id"]) if include_result and row["report_id"] else None,
+               error=row["error"])
 
 
 def new_job(kind: str) -> Job:
-    j = Job(id=uuid.uuid4().hex[:10], kind=kind, created=time.time())
-    with _JOBS_LOCK:
-        JOBS[j.id] = j
-    return j
+    return _legacy_job(job_repository().create(kind))
 
 
 def update_job(job: Job, **fields) -> None:
-    with _JOBS_LOCK:
-        for k, v in fields.items():
-            setattr(job, k, v)
+    repo = job_repository()
+    status = fields.get("status")
+    if status == "running":
+        repo.claim(job.id)
+    elif status in ("done", "error"):
+        repo.finish(job.id, "succeeded" if status == "done" else "failed",
+                    result=fields.get("result"), error=fields.get("error"))
+    if "progress" in fields:
+        repo.progress(job.id, str(fields["progress"]))
+    for key, value in fields.items():
+        setattr(job, key, value)
 
 
 def get_job(jid: str) -> Job | None:
-    with _JOBS_LOCK:
-        return JOBS.get(jid)
+    return _legacy_job(job_repository().get(jid))
 
 
 def list_jobs(limit: int = 20) -> list[Job]:
-    with _JOBS_LOCK:
-        items = sorted(JOBS.values(), key=lambda j: j.created, reverse=True)
-    return items[:limit]
+    return [_legacy_job(row, include_result=False) for row in job_repository().list(limit)]
+
+
+from concurrent.futures import ThreadPoolExecutor
+_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="background-io")
+_PENDING = threading.BoundedSemaphore(32)
 
 
 def spawn(job: Job, fn: Callable[[], Any]) -> None:
-    """在后台线程执行 ``fn``，结果/异常写回 ``job``。"""
-
-    def _run() -> None:
-        update_job(job, status="running")
+    """Bounded I/O work; backtests use BacktestService's isolated processes."""
+    if not _PENDING.acquire(blocking=False):
+        update_job(job, status="error", error="后台队列已满，请稍后重试")
+        return
+    def run():
         try:
-            res = fn()
-            update_job(job, status="done", result=res, finished=time.time())
-        except Exception as exc:                    # noqa: BLE001
-            update_job(job, status="error",
-                       error=f"{type(exc).__name__}: {exc}", finished=time.time())
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
+            if not job_repository().claim(job.id):
+                return
+            job.status = "running"
+            result = fn()
+            if job_repository().get(job.id)["cancel_requested"]:
+                job_repository().finish(job.id, "cancelled")
+            else:
+                update_job(job, status="done", result=result, finished=time.time())
+        except Exception as exc:
+            update_job(job, status="error", error=f"{type(exc).__name__}: {exc}", finished=time.time())
+        finally:
+            _PENDING.release()
+    _EXECUTOR.submit(run)
 
 
 # ============================================================ .env 密钥读写
@@ -237,6 +267,8 @@ def save_settings(s: Settings) -> None:
     """页面改配置的统一落盘入口：写文件后让进程内 get_settings() 单例失效，
     否则之后新建的运行上下文仍读到启动时的旧快照（"保存成功但没生效"）。"""
     from qmt_trade.core.config import reset_settings_cache
-    s.save()
+    from qmt_trade.storage.configuration import publish
+    publish("settings", s.as_dict(), s.data_dir)
     reset_settings_cache()
-    reset_ctx_cache()
+    # Keep current trading contexts alive; scheduler consumes strategy versions
+    # at a boundary. New config remains durable across application restarts.

@@ -24,6 +24,9 @@ def make_raw(syms):
 
 def main():
     tmp = Path(tempfile.mkdtemp(prefix="fin_cache_test_"))
+    import os
+    os.environ["QMT_RUNTIME_DB"] = str(tmp / "cache.duckdb")
+    from qmt_trade.storage.cache import provider_cache
     prov = QmtProvider(cache_dir=str(tmp), fundamental_ttl=86400)
 
     calls = {"n": 0}
@@ -43,9 +46,8 @@ def main():
     # 落盘文件应存在
     for s in syms:
         for t in ("PershareIndex", "Income"):
-            p = prov._fin_path(s, t)
-            assert p.exists(), f"落盘文件缺失: {p}"
-    print("[OK] 首次：触发下载并落盘 parquet，文件数 =", len(list(tmp.glob('*.parquet'))))
+            assert provider_cache(prov).fresh("qmt_" + t, s, 86400)
+    print("[OK] 首次：触发下载并写入 DuckDB，数据集数 =", len(provider_cache(prov).repo.list_keys("qmt_Income")))
 
     # 2) 二次：模拟新进程（清空进程内缓存）→ 应读盘、不触发下载
     prov._fin_cache.clear()
@@ -67,7 +69,7 @@ def main():
     prov._fin_cache.clear()
     # 删掉 600000.SH 的缓存，模拟新上市的票没缓存
     for t in ("PershareIndex", "Income"):
-        prov._fin_path("600000.SH", t).unlink()
+        provider_cache(prov).repo.delete("qmt_" + t, "600000.SH")
     calls["n"] = 0
     out4 = prov._ensure_financial_raw(list(syms), "20230101", "20260813", 10)
     assert len(out4) == 3, f"部分缺失应补齐到 3 只，实际 {len(out4)}"

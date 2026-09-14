@@ -32,8 +32,8 @@ def _json_or(raw, default):
 
 def _active_versions(mode: str) -> dict[str, list[dict]]:
     """按注册策略返回可用于实验的已发布实例版本。"""
-    raw = ctx.make_ctx_research(mode).repos.system.get("strategy_instances", "[]") or "[]"
-    instances = _json_or(raw, [])
+    from .strategy import _instances
+    instances = _instances(mode)
     out: dict[str, list[dict]] = {}
     for item in instances if isinstance(instances, list) else []:
         sid, active = item.get("strategy_id"), item.get("active_version")
@@ -108,87 +108,12 @@ class StrategyBacktestIn(BaseModel):
     version_id: str | None = None
 
 
-@router.post("/backtest")
+@router.post("/backtest", status_code=202)
 def run_backtest(body: StrategyBacktestIn, mode: str = Query("paper")):
-    """后台跑独立策略回测（mock 拒绝；结果摘要落 system_state）。"""
-    from qmt_trade.core.strategies import (
-        STANDALONE_STRATEGIES, build_standalone_backtester,
-    )
-
-    if body.strategy not in STANDALONE_STRATEGIES:
-        raise HTTPException(400, f"未知策略 {body.strategy}，可选 {STANDALONE_STRATEGIES}")
-    version_params: dict = {}
-    if body.version_id:
-        version = next((v for v in _active_versions(mode).get(body.strategy, [])
-                        if v["value"] == body.version_id), None)
-        if version is None:
-            raise HTTPException(422, "所选策略配置版本不存在或未发布")
-        version_params = version["params"]
-    try:
-        start = date.fromisoformat(body.start)
-        end = date.fromisoformat(body.end) if body.end else date.today()
-    except ValueError as exc:
-        raise HTTPException(400, f"日期格式应为 YYYY-MM-DD: {exc}")
-    if start >= end:
-        raise HTTPException(400, f"回测区间非法：{start} 不早于 {end}")
-
-    job = ctx.new_job(f"strategylab_{body.strategy}")
-
-    def _run():
-        c = ctx.make_ctx_research(mode)
-        provider_names = list(getattr(c.hub, "providers", {}).keys())
-        if "mock" in provider_names:
-            raise RuntimeError(
-                "检测到 MockProvider（虚拟标的+随机行情），独立策略回测已拒绝。"
-                "请切到 paper 模式（需 qmt/akshare 数据源）后重试。")
-        bt = build_standalone_backtester(body.strategy, c.settings, c.hub,
-                                         initial_cash=body.cash)
-        if version_params:
-            known = set(getattr(bt.config_class, "__dataclass_fields__", {}))
-            invalid = set(version_params) - known
-            if invalid:
-                raise RuntimeError(f"配置版本含当前策略不支持的参数: {', '.join(sorted(invalid))}")
-            bt.config = bt.config_class(**{**bt.config.__dict__, **version_params})
-        result = bt.run(start, end)
-        if not result.metrics:
-            return {"has_metrics": False,
-                    "error": "; ".join((result.details or ["未知原因"])[:3])}
-        m = dict(result.metrics or {})
-        m["data_mode"] = "real(" + ",".join(provider_names) + ")"
-        summary = {
-            "metrics": m,
-            "cost": result.cost_attribution or {},
-            "n_trades": len(result.trades),
-            "n_closed": len(result.closed_trades),
-            "equity_curve": (result.equity_curve or [])[:500],
-            "version_id": body.version_id,
-            "start": start.isoformat(),
-            "end": end.isoformat(),
-            "cash": body.cash,
-            "strategy": body.strategy,
-            "run_at": date.today().isoformat(),
-        }
-        try:
-            c.shared_repos.system.set(
-                f"strategylab:bt:{body.strategy}:latest",
-                json.dumps(summary, ensure_ascii=False))
-        except Exception:  # noqa: BLE001 - 摘要落库失败不阻塞回测返回
-            pass
-        return {"has_metrics": True, "metrics": m, "cost": summary["cost"],
-                "n_trades": summary["n_trades"], "n_closed": summary["n_closed"]}
-
-    ctx.spawn(job, _run)
-    return {"job_id": job.id, "kind": f"strategylab_{body.strategy}",
-            "strategy": body.strategy, "start": body.start, "end": end.isoformat()}
-
-
-class StrategyScanIn(BaseModel):
-    strategy: str
-    start: str
-    end: str | None = None
-    cash: float = 1_000_000.0
-    grid: dict[str, list] = {}
-    version_id: str | None = None
+    from .backtests import BacktestRequest, submit
+    payload = body.model_dump()
+    payload["end"] = payload.get("end") or date.today().isoformat()
+    return submit(BacktestRequest(**payload), mode)
 
 
 @router.post("/scan")

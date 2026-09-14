@@ -413,56 +413,10 @@ class TailPickBacktestIn(BaseModel):
     cash: float = 1_000_000.0
 
 
-@router.post("/backtest")
+@router.post("/backtest", status_code=202)
 def run_backtest(body: TailPickBacktestIn, mode: str = Query("paper")):
-    """尾盘选股法独立回测（后台 job，/api/jobs/{id} 轮询）。
-
-    与 CLI ``tailpick backtest`` 同款数据真实性护栏：检测到 MockProvider 直接拒绝，
-    严禁用虚拟数据得出业绩结论；无分钟线时降级日线近似并标注【非真实业绩】。
-    """
-    try:
-        start = date.fromisoformat(body.start)
-        end = date.fromisoformat(body.end) if body.end else date.today()
-    except ValueError as exc:
-        raise HTTPException(400, f"日期格式应为 YYYY-MM-DD: {exc}")
-    if start >= end:
-        raise HTTPException(400, f"回测区间非法：{start} 不早于 {end}")
-
-    job = ctx.new_job("tailpick_backtest")
-
-    def _run():
-        # 回测为虚拟撮合不下真单，live 观察期锁定时自动降级 paper
-        c = ctx.make_ctx_research(mode)
-        provider_names = list(getattr(c.hub, "providers", {}).keys())
-        if "mock" in provider_names:
-            raise RuntimeError(
-                "检测到 MockProvider（虚拟标的+随机行情），尾盘回测已拒绝。"
-                "请切到 paper 模式（需 qmt/akshare 数据源）后重试。")
-        from qmt_trade.strategies.tail_pick import TailPickBacktester, TailPickConfig
-
-        cfg = TailPickConfig.from_settings(c.settings)
-        bt = TailPickBacktester(c.settings, c.hub, initial_cash=body.cash,
-                                config=cfg, require_minute=None)
-        result = bt.run(start, end)
-        if not result.metrics:
-            return {"has_metrics": False,
-                    "error": "; ".join((result.details or ["未知原因"])[:3])}
-        m = dict(result.metrics or {})
-        m["data_mode"] = "real(" + ",".join(provider_names) + ")"
-        m["minute_available"] = result.minute_available
-        return {
-            "has_metrics": bool(result.metrics),
-            "metrics": m,
-            "minute_available": result.minute_available,
-            "trades": len(result.trades),
-            "closed_trades": len(result.closed_trades),
-            "equity_curve": (result.equity_curve or [])[:1000],
-            "closed_details": (result.closed_trades or [])[:200],
-            "details": (result.details or [])[:300],
-            "error": None if result.metrics else
-                     "; ".join((result.details or [])[:3]),
-        }
-
-    ctx.spawn(job, _run)
-    return {"job_id": job.id, "kind": "tailpick_backtest",
-            "start": body.start, "end": end.isoformat()}
+    from .backtests import BacktestRequest, submit
+    payload = body.model_dump()
+    payload["strategy"] = "tail_pick"
+    payload["end"] = payload.get("end") or date.today().isoformat()
+    return submit(BacktestRequest(**payload), mode)

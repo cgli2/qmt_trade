@@ -2,41 +2,29 @@
 import { computed } from "vue";
 import { useRoute } from "vue-router";
 import { useApp } from "@/store";
+import TaskCenter from "@/components/TaskCenter.vue";
+import api from "@/api";
+import { tryReq } from "@/toast";
 import ToastHost from "@/components/ToastHost.vue";
 
 const app = useApp();
 const route = useRoute();
 
-const nav = [
-  { group: "总览", items: [{ to: "/", ico: "🏠", label: "工作台" }] },
-  {
-    group: "智能决策",
-    items: [
-      { to: "/selection", ico: "🎯", label: "选股研判" },
-      { to: "/market", ico: "📈", label: "行情与事件" },
-    ],
-  },
-  {
-    group: "交易执行",
-    items: [
-      { to: "/trade/paper", ico: "🧪", label: "模拟盘" },
-      { to: "/trade/live", ico: "🏦", label: "实盘" },
-      { to: "/strategy", ico: "🧩", label: "策略管理" },
-      { to: "/strategylab", ico: "🧪", label: "策略实验室" },
-      { to: "/backtest", ico: "⏳", label: "回测管理" },
-      { to: "/risk", ico: "🛡️", label: "风控管理" },
-    ],
-  },
-  {
-    group: "运维与系统",
-    items: [
-      { to: "/reports", ico: "📄", label: "绩效报告" },
-      { to: "/settings", ico: "⚙️", label: "系统设置" },
-    ],
-  },
-];
+const nav = [{ group: "日常工作", items: [
+  { to: "/", ico: "🏠", label: "工作台" },
+  { to: "/trade", ico: "🏦", label: "交易" },
+  { to: "/strategy", ico: "🧩", label: "策略" },
+  { to: "/backtest", ico: "⏳", label: "回测" },
+  { to: "/market", ico: "📈", label: "行情与选股" },
+  { to: "/settings", ico: "⚙️", label: "设置" },
+]}];
+async function emergencyStop() {
+  await tryReq(() => api.setKillswitch(app.mode, "engage", "顶部紧急停止：禁止新增仓位"), "已请求停止开仓");
+}
 
 const title = computed(() => route.meta.title || "控制台");
+// 交易页把"模式"收敛到内部响应式切换（不重建组件），其余页面保持原有"切模式即刷新"的行为
+const viewKey = computed(() => (route.path.startsWith("/trade") ? "trade" : app.mode));
 const modes = ["paper", "live"];
 const modeLabels: Record<string, string> = {
   paper: "模拟盘",
@@ -84,10 +72,13 @@ function toggleTheme() {
         <select class="mode" :value="app.mode" @change="app.setMode(($event.target as HTMLSelectElement).value)">
           <option v-for="m in modes" :key="m" :value="m">{{ modeLabels[m] ?? m }}</option>
         </select>
+        <strong v-if="app.mode === 'live'" class="badge danger">实盘账户</strong>
+        <TaskCenter />
+        <button class="btn danger" @click="emergencyStop">停止开仓</button>
         <button class="theme-toggle" @click="toggleTheme">{{ app.theme === "dark" ? "☀️" : "🌙" }}</button>
       </header>
       <main class="content">
-        <router-view />
+        <router-view :key="viewKey" />
       </main>
     </div>
     <ToastHost />

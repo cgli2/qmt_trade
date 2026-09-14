@@ -392,24 +392,12 @@ class AkshareProvider(DataProvider):
         return None
 
     def _news_cached_raw(self, sym: str) -> pd.DataFrame | None:
-        code, _ = parse_symbol(sym)
-        path = self._cache_path("news", code)
-        if path is not None and path.exists():
-            try:
-                return pd.read_parquet(path)
-            except Exception:  # noqa: BLE001
-                path.unlink(missing_ok=True)
-        return None
+        from ...storage.cache import provider_cache
+        return provider_cache(self).get("akshare_news", sym, 1800)
 
     def _news_save_raw(self, sym: str, df: pd.DataFrame) -> None:
-        code, _ = parse_symbol(sym)
-        path = self._cache_path("news", code)
-        if path is None:
-            return
-        try:
-            df.to_parquet(path, index=False)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("akshare 新闻(%s) 缓存写入失败: %s", sym, exc)
+        from ...storage.cache import provider_cache
+        provider_cache(self).put("akshare_news", sym, df)
 
     @staticmethod
     def _parse_news(df: pd.DataFrame | None, symbol: str | None) -> list[NewsItem]:
@@ -529,14 +517,6 @@ class AkshareProvider(DataProvider):
         return out
 
     # ---- 业绩报表 / 资产负债表（带磁盘缓存，历史报告期内容不再变化）----
-    def _cache_path(self, tag: str, period: str) -> Path | None:
-        root = self.options.get("cache_dir")
-        if not root:
-            return None
-        p = Path(root)
-        p.mkdir(parents=True, exist_ok=True)
-        return p / f"{tag}_{period}.parquet"
-
     def _yjbb_cached(self, period: str) -> pd.DataFrame | None:
         return self._batch_cached("fundamentals_yjbb", period,
                                   lambda: self._ak().stock_yjbb_em(date=period))
@@ -546,12 +526,11 @@ class AkshareProvider(DataProvider):
                                   lambda: self._ak().stock_zcfz_em(date=period))
 
     def _batch_cached(self, tag: str, period: str, fetch) -> pd.DataFrame | None:
-        path = self._cache_path(tag, period)
-        if path is not None and path.exists():
-            try:
-                return pd.read_parquet(path)
-            except Exception:  # noqa: BLE001  缓存损坏则重拉
-                path.unlink(missing_ok=True)
+        from ...storage.cache import provider_cache
+        cache = provider_cache(self)
+        cached = cache.get("akshare_" + tag, period, 86400)
+        if cached is not None:
+            return cached
         df = None
         for attempt in range(3):
             try:
@@ -565,11 +544,7 @@ class AkshareProvider(DataProvider):
         if df is None or df.empty:
             logger.warning("akshare %s(%s) 取数失败", tag, period)
             return None
-        if path is not None:
-            try:
-                df.to_parquet(path, index=False)
-            except Exception as exc:  # noqa: BLE001  写缓存失败不影响本次使用
-                logger.debug("akshare %s(%s) 缓存写入失败: %s", tag, period, exc)
+        cache.put("akshare_" + tag, period, df)
         return df
 
     @staticmethod
@@ -637,22 +612,12 @@ class AkshareProvider(DataProvider):
         return None
 
     def _moneyflow_cached(self, code: str) -> pd.DataFrame | None:
-        path = self._cache_path("moneyflow", code)
-        if path is not None and path.exists():
-            try:
-                return pd.read_parquet(path)
-            except Exception:  # noqa: BLE001
-                path.unlink(missing_ok=True)
-        return None
+        from ...storage.cache import provider_cache
+        return provider_cache(self).get("akshare_moneyflow", code, 1800)
 
     def _moneyflow_save(self, code: str, df: pd.DataFrame) -> None:
-        path = self._cache_path("moneyflow", code)
-        if path is None:
-            return
-        try:
-            df.to_parquet(path, index=False)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("akshare 资金流(%s) 缓存写入失败: %s", code, exc)
+        from ...storage.cache import provider_cache
+        provider_cache(self).put("akshare_moneyflow", code, df)
 
     # ------------------------------------------------------------ 实时行情
     def get_realtime(self, symbols: Sequence[str]) -> dict[str, Tick]:

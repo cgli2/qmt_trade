@@ -543,7 +543,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mode", choices=("paper", "live"), default="paper",
                    help="运行模式：paper=真数据模拟撮合 / live=实盘")
     p.add_argument("--config", help="配置文件路径，默认 config/settings.yaml")
-    p.add_argument("--db", help="SQLite 路径，默认 data/trade.db（live 模式默认 data/trade_live.db）")
+    p.add_argument("--db", help="显式离线 DuckDB 路径；禁止与运行服务同时访问")
+    p.add_argument("--server", default="http://127.0.0.1:7099", help="在线 API 地址（默认通过唯一数据库所有者访问）")
+    p.add_argument("--offline", action="store_true", help="服务停止后的独占离线操作")
     p.add_argument("--log-level", default=None, help="DEBUG/INFO/WARNING/ERROR")
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -638,6 +640,9 @@ def main(argv: list[str] | None = None) -> int:
         logging.basicConfig(level=args.log_level or "INFO")
 
     try:
+        if not args.offline and not args.db:
+            from .cli_online import execute
+            return execute(args)
         return int(args.func(args) or EXIT_OK)
     except ContextError as exc:
         logger.error(f"装配失败：{exc}")

@@ -137,7 +137,13 @@ def job(name: str, *, critical: bool | None = None):
             t0 = time.perf_counter()
             self._beat(name)
             try:
-                raw = fn(self, *args, **kw)
+                import threading
+                from ..storage.strategies import StrategyRepository
+                if not hasattr(self.ctx, "_strategy_boundary_lock"):
+                    self.ctx._strategy_boundary_lock = threading.RLock()
+                with self.ctx._strategy_boundary_lock:
+                    StrategyRepository(self.ctx.repos.db).apply_at_boundary(self.ctx)
+                    raw = fn(self, *args, **kw)
             except Exception as exc:                # noqa: BLE001 - 调度层是最后一道防线
                 elapsed = time.perf_counter() - t0
                 res = JobResult(name, ok=False, reason=f"{type(exc).__name__}: {exc}",

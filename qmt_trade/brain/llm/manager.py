@@ -36,7 +36,8 @@ class LLMManager:
             daily_budget_cny=float(cfg.budget.get("daily_cny", 30.0)),
             monthly_budget_cny=float(cfg.budget.get("monthly_cny", 600.0)),
         )
-        self.cache = LLMCache(cfg.cache_path) if cfg.cache_enabled else None
+        from ...storage.runtime import runtime_path
+        self.cache = LLMCache(runtime_path()) if cfg.cache_enabled else None
         #: 审计钩子：每次**真实调用**成功后回调（缓存命中不回调，避免重复记账）。
         #: 由应用层挂接落库 llm_calls 表；钩子异常不影响主流程。
         self.audit = None

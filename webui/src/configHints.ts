@@ -24,7 +24,7 @@ export const CONFIG_HINTS: Record<string, string> = {
   // ============ app 应用基础 ============
   "app.name": "应用名称（仅标识用）",
   "app.timezone": "系统时区，默认 Asia/Shanghai",
-  "app.data_dir": "本地数据存放目录（SQLite、缓存等）",
+  "app.data_dir": "本地数据存放目录（DuckDB、Parquet、缓存等）",
   "app.log_dir": "日志文件存放目录",
   "app.log_level": "日志级别：DEBUG / INFO / WARNING / ERROR",
 

@@ -13,7 +13,7 @@
   没人知道昨天跑到哪一步（P6）；
 - **KillSwitch 状态跨重启保持**：拉闸后重启回到 NORMAL 是致命的；
 - **状态走数据库不走内存**：盘中进程重启后要能从 ``plans`` 表接着做；
-- **模拟盘不许碰真实下单路径**：``sim`` 装配出来的必须是 SimGateway。
+- **模拟盘不许碰真实下单路径**：``paper`` 装配出来的必须是 SimGateway。
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from qmt_trade.app import (                                      # noqa: E402
-    KILL_STATE_KEY, ContextError, TradingContext, build_context,
+    KILL_STATE_KEY, ContextError, TradingContext, build_context as _real_build_context,
 )
 from qmt_trade.risk.killswitch import KillMode                   # noqa: E402
 from qmt_trade.scheduler import (                                # noqa: E402
@@ -37,6 +37,19 @@ from qmt_trade.scheduler import (                                # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s")
 logger = logging.getLogger(__name__)
+
+def build_context(mode="paper", **kwargs):
+    from qmt_trade.datahub.providers.mock import MockProvider
+    from qmt_trade.ops.notify import Notifier, MemoryChannel
+    kwargs.setdefault("providers", [MockProvider(n_symbols=30)])
+    kwargs.setdefault("notifier", Notifier(channels=[MemoryChannel()]))
+    context = _real_build_context(mode, **kwargs)
+    from qmt_trade.brain.graph import BrainGraph
+    from qmt_trade.brain.llm.client import LLMClient
+    from qmt_trade.brain.llm.mock import MockLLM
+    context._brain = BrainGraph(context.settings, context.hub, LLMClient(MockLLM()), use_llm=True)
+    return context
+
 
 PASS = FAIL = 0
 D = date(2026, 8, 7)          # 周五，交易日
@@ -59,7 +72,7 @@ def _tmp_db(tag: str) -> str:
     return str(d / "trade.db")
 
 
-def _ctx(tag: str, mode: str = "sim", **kw) -> TradingContext:
+def _ctx(tag: str, mode: str = "paper", **kw) -> TradingContext:
     return build_context(mode, db_path=_tmp_db(tag), initial_cash=1_000_000, **kw)
 
 
@@ -69,7 +82,7 @@ def test_context() -> None:
     ctx = _ctx("ctx")
     try:
         from qmt_trade.execution.gateway import SimGateway
-        check("sim 模式装配 SimGateway（不碰真实下单路径）",
+        check("paper 模式装配 SimGateway（不碰真实下单路径）",
               isinstance(ctx.gateway, SimGateway), type(ctx.gateway).__name__)
         check("初始资金进入组合", abs(ctx.portfolio.cash - 1_000_000) < 1,
               f"cash={ctx.portfolio.cash:,.0f}")
@@ -100,7 +113,7 @@ def _raises(fn) -> bool:
 def test_killswitch_persist() -> None:
     logger.info("\n[2] KillSwitch 跨重启保持档位")
     db = _tmp_db("kill")
-    ctx = build_context("sim", db_path=db, initial_cash=100_000)
+    ctx = build_context("paper", db_path=db, initial_cash=100_000)
     try:
         ctx.killswitch.engage("模拟数据源全挂")
         check("engage → REDUCE_ONLY", ctx.killswitch.mode is KillMode.REDUCE_ONLY)
@@ -110,7 +123,7 @@ def test_killswitch_persist() -> None:
     finally:
         ctx.close()
 
-    ctx2 = build_context("sim", db_path=db, initial_cash=100_000)   # 模拟重启
+    ctx2 = build_context("paper", db_path=db, initial_cash=100_000)   # 模拟重启
     try:
         check("重启后仍是 REDUCE_ONLY（不会偷偷恢复交易）",
               ctx2.killswitch.mode is KillMode.REDUCE_ONLY, ctx2.killswitch.mode.value)
@@ -122,7 +135,7 @@ def test_killswitch_persist() -> None:
     finally:
         ctx2.close()
 
-    ctx3 = build_context("sim", db_path=db, initial_cash=100_000)
+    ctx3 = build_context("paper", db_path=db, initial_cash=100_000)
     try:
         check("reset 也持久化", ctx3.killswitch.mode is KillMode.NORMAL)
     finally:
@@ -253,7 +266,7 @@ def test_full_day() -> None:
 def test_restart_resume() -> None:
     logger.info("\n[7] 盘中重启后从数据库接着做")
     db = _tmp_db("resume")
-    ctx = build_context("sim", db_path=db, initial_cash=1_000_000)
+    ctx = build_context("paper", db_path=db, initial_cash=1_000_000)
     try:
         r1 = JobRunner(ctx, trade_date=D)
         r1.data_sync(); r1.regime(); r1.selection(); r1.research(); r1.plan()
@@ -262,7 +275,7 @@ def test_restart_resume() -> None:
     finally:
         ctx.close()
 
-    ctx2 = build_context("sim", db_path=db, initial_cash=1_000_000)   # 崩溃重启
+    ctx2 = build_context("paper", db_path=db, initial_cash=1_000_000)   # 崩溃重启
     try:
         r2 = JobRunner(ctx2, trade_date=D)
         check("新进程内存缓存是空的（确实是冷启动）", not r2.cache)
@@ -365,7 +378,7 @@ def test_cli() -> None:
     p = build_parser()
     a = p.parse_args(["run", "--plan-only"])
     check("默认模式不是 live（手滑不会送钱）", a.mode != "live", a.mode)
-    check("默认 sim", a.mode == "sim", a.mode)
+    check("默认 paper", a.mode == "paper", a.mode)
 
     a = p.parse_args(["--mode", "live", "run"])
     check("live 必须显式指定", a.mode == "live")
@@ -399,30 +412,34 @@ def test_cli() -> None:
 
 def test_cli_run() -> None:
     logger.info("\n[13] CLI 端到端")
-    from qmt_trade.cli import main
+    from qmt_trade.cli import main as cli_main
+    from unittest.mock import patch
+    def main(args):
+        with patch("qmt_trade.cli.build_context", build_context):
+            return cli_main(args)
 
     db = _tmp_db("cli")
-    rc = main(["--mode", "sim", "--db", db, "run", "--plan-only"])
+    rc = main(["--mode", "paper", "--db", db, "run", "--plan-only"])
     check("run --plan-only 退出码 0", rc == 0, f"rc={rc}")
 
-    rc = main(["--mode", "sim", "--db", db, "health"])
+    rc = main(["--mode", "paper", "--db", db, "health"])
     check("health 退出码 0", rc == 0, f"rc={rc}")
 
-    rc = main(["--mode", "sim", "--db", db, "run", "--once", "selection",
+    rc = main(["--mode", "paper", "--db", db, "run", "--once", "selection",
                "--date", D.isoformat()])
     check("run --once selection 退出码 0", rc == 0, f"rc={rc}")
 
-    rc = main(["--mode", "sim", "--db", db, "run", "--once", "不存在的任务"])
+    rc = main(["--mode", "paper", "--db", db, "run", "--once", "不存在的任务"])
     check("未知任务返回非 0（不静默成功）", rc != 0, f"rc={rc}")
 
-    rc = main(["--mode", "sim", "--db", db, "killswitch", "--engage", "冒烟演练"])
+    rc = main(["--mode", "paper", "--db", db, "killswitch", "--engage", "冒烟演练"])
     check("killswitch --engage 退出码 0（动作成功即成功）", rc == 0, f"rc={rc}")
 
     # 纯查询时退出码反映健康度，方便 `killswitch || 报警` 这种脚本用法
-    rc = main(["--mode", "sim", "--db", db, "killswitch"])
+    rc = main(["--mode", "paper", "--db", db, "killswitch"])
     check("killswitch 纯查询：已拉闸 → 非 0", rc != 0, f"rc={rc}")
 
-    ctx = build_context("sim", db_path=db)
+    ctx = build_context("paper", db_path=db)
     try:
         check("CLI 拉闸生效且持久化",
               ctx.killswitch.mode is KillMode.REDUCE_ONLY, ctx.killswitch.mode.value)
@@ -430,9 +447,9 @@ def test_cli_run() -> None:
     finally:
         ctx.close()
 
-    rc = main(["--mode", "sim", "--db", db, "killswitch", "--reset", "演练结束"])
+    rc = main(["--mode", "paper", "--db", db, "killswitch", "--reset", "演练结束"])
     check("killswitch --reset 退出码 0", rc == 0, f"rc={rc}")
-    rc = main(["--mode", "sim", "--db", db, "killswitch"])
+    rc = main(["--mode", "paper", "--db", db, "killswitch"])
     check("纯查询：已恢复 → 0", rc == 0, f"rc={rc}")
 
 

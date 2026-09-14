@@ -61,7 +61,7 @@ class TradingContext:
     """组件容器。所有属性懒加载，用到才装配。
 
     ``close()`` 后不要再复用；需要新环境请重新构造（测试里尤其重要，
-    否则 SQLite 连接会跨用例串味）。
+    否则 DuckDB 连接会跨用例串味）。
     """
 
     def __init__(
@@ -82,6 +82,8 @@ class TradingContext:
         if mode not in VALID_MODES:
             raise ContextError(f"未知运行模式 {mode!r}，可选 {VALID_MODES}")
         self.mode = mode
+        import threading
+        self._strategy_boundary_lock = threading.RLock()
         self.settings = settings if settings is not None else get_settings()
         self.calendar = TradingCalendar()
 
@@ -124,11 +126,10 @@ class TradingContext:
             else:
                 path = self._db_path
                 if path is None:
-                    # 账本物理隔离：live 与 paper 分库，模拟盘数据绝不污染实盘账本
-                    name = "trade_live.db" if self.is_live else "trade.db"
-                    path = self.settings.data_dir / name
-                    Path(path).parent.mkdir(parents=True, exist_ok=True)
-                self._db = Database(path)
+                    from .storage.runtime import ledger_database
+                    self._db = ledger_database(self.settings.data_dir, self.mode)
+                else:
+                    self._db = Database(path)
         return self._db
 
     @property
@@ -154,8 +155,8 @@ class TradingContext:
             # 外部注入 repos / 指定了 db_path（测试、回测）：不另开共享库
             self._shared_repos = self.repos
             return self._shared_repos
-        path = self.settings.data_dir / "trade.db"
-        self._shared_db = Database(path)
+        from .storage.runtime import ledger_database
+        self._shared_db = ledger_database(self.settings.data_dir, "paper")
         self._shared_repos = Repos.create(self._shared_db)
         return self._shared_repos
 

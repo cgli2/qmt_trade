@@ -85,21 +85,9 @@ class LimitUpBacktester(StandaloneBacktester):
         self._load_industry_map()
 
     def _load_industry_map(self):
-        path = self.config.industry_map_path
-        if not path:
-            return
-        try:
-            import os
-            if not os.path.exists(path):
-                return
-            with open(path, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            m = raw.get("map", raw) if isinstance(raw, dict) else {}
-            self._industry_map = {str(k): str(v) for k, v in m.items() if v}
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("行业映射加载失败 %s: %s", path, exc)
+        from ..storage.industry import industry_map
+        self._industry_map = industry_map(self.config.industry_map_path)
 
-    # ---------------------------------------------------------- 预热增强
     def _prewarm(self, start, end):
         super()._prewarm(start, end)
         if not self._bars:

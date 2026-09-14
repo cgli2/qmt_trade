@@ -126,6 +126,8 @@ def _symbol_name(c, symbol: str) -> str:
 def _enrich_positions(c, rows: list[dict]) -> list[dict]:
     """给本地账本持仓补展示字段：名称/市值/浮动盈亏/持有天数（不改动库内数据）。"""
     today = date.today()
+    from server.display_cache import symbol_names
+    names = symbol_names(c, [r.get("symbol", "") for r in rows])
     out: list[dict] = []
     for r in rows:
         r = dict(r)
@@ -139,7 +141,7 @@ def _enrich_positions(c, rows: list[dict]) -> list[dict]:
             r["holding_days"] = (today - date.fromisoformat(entry)).days
         except ValueError:
             r["holding_days"] = None
-        r["name"] = _symbol_name(c, r.get("symbol", ""))
+        r["name"] = names.get(r.get("symbol", ""), "")
         out.append(r)
     return out
 

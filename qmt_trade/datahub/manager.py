@@ -24,7 +24,7 @@ from .cache import CategoryCache
 from .pit import PITGuard
 from .providers.base import Capability, DataProvider
 from .sentiment import score_sentiment
-from .store import ParquetStore
+from .store import DuckDBStore
 from .types import Adjust, CorpEvent, Freq, Fundamental, InstrumentInfo, NewsItem, Tick, SourceSkipped
 
 logger = get_logger("datahub.manager")
@@ -67,7 +67,7 @@ class DataHub:
         settings: Settings,
         providers: Sequence[DataProvider] | None = None,
         *,
-        store: ParquetStore | None = None,
+        store: DuckDBStore | None = None,
         asof: date | datetime | None = None,
         strict_pit: bool = True,
     ):
@@ -88,7 +88,7 @@ class DataHub:
                 "fundamental": cache_cfg.get("fundamental_ttl", 86400),
             },
         )
-        self.store = store or ParquetStore(settings.data_dir / "parquet")
+        self.store = store or DuckDBStore(settings.data_dir / "parquet")
         # 行情磁盘持久化缓存目录（性能修复 2026-08-12）：
         # 历史日线"拉一次落盘，重跑直接读"，避免每次回测都从数据源重拉全量。
         self.bars_cache_dir = settings.data_dir / "bars_cache"
@@ -96,6 +96,8 @@ class DataHub:
             self.bars_cache_dir.mkdir(parents=True, exist_ok=True)
         except OSError:
             self.bars_cache_dir = None
+        # 过期日线缓存清理节流（b2）：写路径触发，每进程每小时至多一次。
+        self._last_bars_evict = 0.0
         self.asof = asof
         self.strict_pit = strict_pit
         quality = settings.section("datahub.quality")
@@ -225,19 +227,50 @@ class DataHub:
             key = (tuple(syms), freq.value, str(start), str(end), adjust.value)
         cached = self.cache.get(category, key)
         if cached is None:
-            # 磁盘持久化缓存（仅日线）：data/bars_cache/ 下按 key 指纹落盘，
-            # 跨进程/跨运行重跑直接读，不再向数据源重拉全量。
-            disk = self._load_bars_disk(key) if range_cache else None
-            if disk is not None:
-                cached = disk
+            if range_cache:
+                # 磁盘持久化缓存（仅日线）按**标的**分片落盘：命中的直接复用，
+                # 只对未命中的标的向数据源下载（b1）。跨进程/跨池重跑不再全量重拉。
+                hits, missing = self._load_bars_disk(syms, freq, start, adjust)
+                frames = list(hits.values())
+                if missing:
+                    try:
+                        downloaded = self._dispatch(
+                            "bars",
+                            Capability.BARS,
+                            lambda p: p.get_bars(missing, freq, start, end, adjust),
+                            context=f"bars {len(missing)} symbols",
+                            # 单标的取数返回空通常是停牌/未收录（合法业务答案），不计熔断；
+                            # 否则几只停牌票就能沿降级链把全部行情源熔断掉。
+                            empty_is_fault=len(missing) > 1,
+                        )
+                        downloaded = self._normalize_bars(downloaded)
+                        if downloaded is not None and not downloaded.empty:
+                            frames.append(downloaded)
+                    except DataUnavailableError:
+                        # 无任何命中又下载失败 → 保持原 fail-safe 向上抛；
+                        # 已有部分命中 → 沿用命中标的（新增标的可能是停牌，不拖垮全池）。
+                        if not frames:
+                            raise
+                        logger.warning("部分标的(%d)行情下载失败，沿用已命中的 %d 个磁盘缓存标的",
+                                       len(missing), len(frames))
+                # 合并多标的后按 symbol 重算 prev_close，保证与单次全量拉取一致。
+                cached = (self._normalize_bars(pd.concat(frames, ignore_index=True))
+                          if frames else pd.DataFrame())
+                if validate and not cached.empty:
+                    report = self.validate_bars(cached)
+                    if not report.ok:
+                        logger.warning("行情数据质量问题: %s", report)
+                # 只落盘本次真正下载到的标的（命中的已在盘上，无需重写）。
+                if missing and not cached.empty:
+                    fresh = cached[cached["symbol"].isin(set(missing))]
+                    if not fresh.empty:
+                        self._save_bars_disk(fresh, freq, start, adjust)
             else:
                 cached = self._dispatch(
                     "bars",
                     Capability.BARS,
                     lambda p: p.get_bars(syms, freq, start, end, adjust),
                     context=f"bars {len(syms)} symbols",
-                    # 单标的取数返回空通常是停牌/未收录（合法业务答案），不计熔断；
-                    # 否则几只停牌票就能沿降级链把全部行情源熔断掉。
                     empty_is_fault=len(syms) > 1,
                 )
                 cached = self._normalize_bars(cached)
@@ -245,8 +278,6 @@ class DataHub:
                     report = self.validate_bars(cached)
                     if not report.ok:
                         logger.warning("行情数据质量问题: %s", report)
-                if range_cache:
-                    self._save_bars_disk(key, cached)
             self.cache.set(category, key, cached)
 
         # ---- 增量：请求 end 超出缓存覆盖范围时，只拉缺口合并（不重拉全量）----
@@ -272,7 +303,7 @@ class DataHub:
                         # 增量合并后 prev_close 需基于全表重算（增量首行依赖缓存末行）
                         cached = self._normalize_bars(cached)
                         self.cache.set(category, key, cached)
-                        self._save_bars_disk(key, cached)
+                        self._save_bars_disk(cached, freq, start, adjust)
                 except DataUnavailableError:
                     logger.warning("行情增量取数失败（%s~%s），沿用已有缓存", delta_start, end)
 
@@ -300,69 +331,79 @@ class DataHub:
     # v3（2026-08-13）：曾出现 QMT 本地缺最近日线时缓存到「日期错位」序列
     # （尾行停在 T-1，策略用错日数据判涨幅/新高），全量作废重拉。
     _BARS_DISK_SCHEMA = 3
+    # 过期缓存清理节流间隔（秒）：写路径触发，每进程每小时至多一次（b2）。
+    _BARS_EVICT_INTERVAL = 3600
 
     def _bars_disk_enabled(self) -> bool:
         """磁盘持久化仅对**真实数据源**启用：mock 是合成数据（不同实例参数生成的
         序列不同），落盘只会造成跨进程串库（曾导致 smoke_selection 偶发失败）。"""
         return self.bars_cache_dir is not None and "mock" not in self.providers
 
-    def _bars_disk_key(self, key: tuple) -> tuple:
-        """磁盘 key = 内存 key + 数据源集合（防不同源配置串库）+ schema 版本。"""
-        return key + (tuple(sorted(self.providers)), self._BARS_DISK_SCHEMA)
+    def _bars_disk_sym_key(self, symbol: str, freq: Freq, start, adjust: Adjust) -> tuple:
+        """按标的的磁盘 key：单标的 + freq + start + adjust + 数据源集合 + schema。
 
-    def _bars_disk_paths(self, key: tuple) -> tuple[Path | None, Path | None]:
-        if self.bars_cache_dir is None:
-            return None, None
-        try:
-            fp = hashlib.md5(repr(self._bars_disk_key(key)).encode("utf-8")).hexdigest()[:16]
-            return (self.bars_cache_dir / f"bars_{fp}.parquet",
-                    self.bars_cache_dir / f"bars_{fp}.meta.json")
-        except Exception:  # noqa: BLE001
-            return None, None
+        旧 _bars_disk_key 把整个股票池塞进 key（全市场硬筛一次 5,219 只 → 67,912
+        字符）：池组成每变一次 key 就完全不同、永不命中，每次扫描/回测都从数据源
+        全量重拉全市场日线——系统卡顿根因（b1）。改为按标的分片后，重叠标的跨池
+        复用，只下载真正新增的标的，且每个 key 定长极短。
+        """
+        return (symbol, freq.value, str(start), adjust.value,
+                tuple(sorted(self.providers)), self._BARS_DISK_SCHEMA)
 
-    def _load_bars_disk(self, key: tuple) -> pd.DataFrame | None:
-        import json as _json
-        import time as _t
-
+    def _load_bars_disk(self, syms, freq, start, adjust):
+        """按标的批量加载磁盘缓存，返回 (命中的 {symbol: DataFrame}, 未命中的 [symbol])。"""
         if not self._bars_disk_enabled():
-            return None
-        path, meta_path = self._bars_disk_paths(key)
-        if path is None or not path.exists():
-            return None
+            return {}, list(syms)
+        key_by_sym = {s: repr(self._bars_disk_sym_key(s, freq, start, adjust)) for s in syms}
         try:
-            meta: dict = {}
-            if meta_path and meta_path.exists():
-                meta = _json.loads(meta_path.read_text(encoding="utf-8"))
-            if meta.get("cache_key") != repr(self._bars_disk_key(key)):
-                return None  # hash 冲突/串库：直接不用
-            age = _t.time() - float(meta.get("written_at", path.stat().st_mtime))
-            if age > self._BARS_DISK_TTL:
-                path.unlink(missing_ok=True)
-                return None
-            df = pd.read_parquet(path)
-            return df if not df.empty else None
-        except Exception:  # noqa: BLE001
-            try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            return None
+            frames = self.store.read_many_batch(
+                "bars_cache", list(key_by_sym.values()), ttl_seconds=self._BARS_DISK_TTL)
+        except Exception as exc:  # noqa: BLE001 - 缓存读失败降级为重拉
+            logger.warning("日线磁盘缓存批量读取失败，转为重拉: %s", exc)
+            return {}, list(syms)
+        hits: dict[str, pd.DataFrame] = {}
+        missing: list[str] = []
+        for sym, cache_key in key_by_sym.items():
+            df = frames.get(cache_key)
+            if df is not None and not df.empty:
+                hits[sym] = df
+            else:
+                missing.append(sym)
+        return hits, missing
 
-    def _save_bars_disk(self, key: tuple, df: pd.DataFrame) -> None:
-        import json as _json
-        import time as _t
-
+    def _save_bars_disk(self, df: pd.DataFrame, freq, start, adjust) -> None:
+        """按标的分片落盘：df 内每个 symbol 各自一个 key（池变化时重叠标的仍复用）。"""
         if not self._bars_disk_enabled() or df is None or df.empty:
             return
-        path, meta_path = self._bars_disk_paths(key)
-        if path is None:
-            return
         try:
-            df.to_parquet(path, index=False)
-            _json.dump({"cache_key": repr(self._bars_disk_key(key)), "written_at": _t.time()},
-                       open(meta_path, "w", encoding="utf-8"))
+            self.store.write_partitioned(
+                "bars_cache", df,
+                key_fn=lambda s: repr(self._bars_disk_sym_key(s, freq, start, adjust)),
+                partition_col="symbol")
+        except Exception as exc:  # noqa: BLE001 - 缓存写失败不影响主流程
+            logger.warning("日线磁盘缓存分片写入失败: %s", exc)
+        self._evict_bars_disk()
+
+    def _evict_bars_disk(self) -> None:
+        """淘汰过期的日线磁盘缓存（b2）。
+
+        TTL 此前只影响读命中，过期行永不删除，随股票池变化无限堆积（磁盘只增
+        不减）。写路径触发、每小时至多一次，把磁盘占用锁死在「活跃 key」范围内。
+        淘汰失败不影响主流程（只是少清一次，下次写入再试）。
+        """
+        import time
+        if not self._bars_disk_enabled():
+            return
+        now = time.time()
+        if now - self._last_bars_evict < self._BARS_EVICT_INTERVAL:
+            return
+        self._last_bars_evict = now
+        try:
+            removed = self.store.evict_expired("bars_cache", self._BARS_DISK_TTL, now=now)
+            if removed:
+                logger.info("清理过期日线缓存 %d 个 key", removed)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("bars 磁盘缓存写入失败: %s", exc)
+            logger.warning("过期日线缓存清理失败: %s", exc)
 
     # ------------------------------------------------------------ PIT 切片helper
     def _slice_frame(

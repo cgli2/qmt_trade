@@ -30,6 +30,10 @@ echo "===== $(date '+%F %T') watchdog 启动 (WinPID $WINPID) =====" >> "$LOG"
 
 fails=0
 while true; do
+  if [ -f "$LOG_DIR/maintenance.lock" ]; then
+    sleep 5
+    continue
+  fi
   if "$PY" -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:$PORT/api/health', timeout=5).status==200 else 1)" 2>/dev/null; then
     if [ "$fails" -gt 0 ]; then
       echo "$(date '+%F %T') 后端恢复健康" >> "$LOG"

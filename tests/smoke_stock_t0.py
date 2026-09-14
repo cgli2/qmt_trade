@@ -182,7 +182,7 @@ def test_exact_buy_shares() -> None:
     from qmt_trade.datahub.providers.mock import MockProvider
 
     mock = MockProvider(n_symbols=6, start="2025-01-02", end="2026-08-07", seed=5)
-    with build_context("paper", providers=[mock]) as ctx:
+    with build_context("paper", providers=[mock], db_path=":memory:") as ctx:
         sym = mock.symbols[0]
         pos = Position(symbol=sym, shares=1000, avg_cost=10.0, can_use=1000,
                        opened_at=date(2020, 1, 2),

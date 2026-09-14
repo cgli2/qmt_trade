@@ -203,6 +203,11 @@ def _default_config() -> LLMConfig:
 
 
 def load_llm_config(path: str | Path | None = None) -> LLMConfig:
+    if path is None:
+        from ...storage.configuration import read_active
+        active = read_active("llm")
+        if active is not None:
+            return _parse_config(active)
     p = Path(path) if path else _DEFAULT_PATH
     if not p.exists():
         return _default_config()
@@ -221,7 +226,12 @@ def parse_llm_config(raw: dict) -> LLMConfig:
 
 def save_llm_config(cfg: LLMConfig, path: str | Path | None = None) -> Path:
     """把配置写回 ``config/llm.yaml``（首次写盘前留 ``.bak`` 备份）。"""
-    p = Path(path) if path else _DEFAULT_PATH
+    if path is None:
+        from ...storage.configuration import publish
+        from ...storage.runtime import runtime_path
+        publish("llm", cfg.to_dict())
+        return runtime_path()
+    p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     if p.exists():
         bak = p.with_name(p.name + ".bak")

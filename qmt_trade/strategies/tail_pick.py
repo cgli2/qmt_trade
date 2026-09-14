@@ -970,20 +970,8 @@ class TailPickScreener:
     # ---------------------------------------------------------- 板块效应
     @staticmethod
     def _load_industry_map(path: str) -> dict[str, str]:
-        """加载东财行业映射快照 {symbol: 行业名}。文件缺失/损坏返回空 dict
-        （板块过滤降级为中性放行，不阻断选股）。"""
-        import json
-        import os
-        if not path or not os.path.exists(path):
-            return {}
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            m = raw.get("map", raw) if isinstance(raw, dict) else {}
-            return {str(k): str(v) for k, v in m.items() if v}
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("行业映射加载失败 %s: %s", path, exc)
-            return {}
+        from ..storage.industry import industry_map
+        return industry_map(path)
 
     def _industry_rank(self, daily: pd.DataFrame,
                        day: date) -> tuple[list[str], set[str], dict[str, bool]]:
@@ -1089,6 +1077,7 @@ class TailPickExecutor:
 @dataclass
 class TailPickResult:
     equity_curve: list[float] = field(default_factory=list)
+    equity_dates: list[str] = field(default_factory=list)
     trades: list = field(default_factory=list)
     closed_trades: list = field(default_factory=list)
     open_positions: list = field(default_factory=list)
@@ -1304,6 +1293,8 @@ class TailPickBacktester:
                     self.minute_available, self.cfg.max_positions, self.cfg.overnight_stop_pct * 100)
 
         for d in days:
+            if getattr(self, "progress_callback", None):
+                self.progress_callback(days.index(d), len(days))
             # T+1 解锁隔夜仓（昨日买入今日可卖）
             self.portfolio.mark_t1(d)
             # —— 离场：卖出昨日 14:30 买入的仓（今日时间不对称离场）——
@@ -1657,6 +1648,7 @@ class TailPickBacktester:
                 last_prices[sym] = bar.close
         self.portfolio.refresh(last_prices)
         self.portfolio.record_equity(day_end=True)
+        result.equity_dates.append(d.isoformat())
         result.equity_curve.append(round(self.portfolio.total_asset, 2))
 
     # ---------------------------------------------------------- 撮合 Bar 构造

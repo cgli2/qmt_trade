@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class BacktestResult:
     equity_curve: list[float] = field(default_factory=list)
+    equity_dates: list[str] = field(default_factory=list)
     trades: list = field(default_factory=list)          # 逐笔成交（Fill）
     closed_trades: list = field(default_factory=list)   # 平仓明细（round-trip），喂 L5 复盘
     open_positions: list = field(default_factory=list)  # 期末未平仓持仓快照（含浮盈），供"含浮盈组合胜率"
@@ -190,6 +191,8 @@ class BacktestEngine:
                     self.stop_pct if self.stop_mode == "FIXED_PCT" else f"{self.stop_atr_mult}×ATR",
                     self.max_entry_gap * 100, self.skip_held_rebuy)
         for i, d in enumerate(days[:-1]):
+            if getattr(self, "progress_callback", None):
+                self.progress_callback(days.index(d), len(days))
             next_day = days[i + 1]
             # 由权益曲线派生当日/近5日亏损（修正执行滞后），喂给风控熔断
             self._derive_loss_limits()
@@ -297,6 +300,7 @@ class BacktestEngine:
             last_next = self._last_prices(next_day)
             self.portfolio.refresh(last_next)
             self.portfolio.record_equity(day_end=True)
+            result.equity_dates.append(next_day.isoformat())
             result.equity_curve.append(round(self.portfolio.total_asset, 2))
             result.details.append({
                 "date": d.isoformat(), "asset": round(self.portfolio.total_asset, 2),

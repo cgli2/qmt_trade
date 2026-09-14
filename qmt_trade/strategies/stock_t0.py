@@ -194,6 +194,8 @@ class StockT0Backtester:
               "days_traded": 0, "day_pnl": []}
         base_shares_map = self._enter_base(days[0], universe)   # 存量底仓，仅首日一次
         for i, d in enumerate(days):
+            if getattr(self, "progress_callback", None):
+                self.progress_callback(days.index(d), len(days))
             if i + 1 < len(days):
                 self.portfolio.mark_t1(days[i + 1])
             day_pnl = self._intraday_t0(d, universe, t0, base_shares_map)
@@ -204,6 +206,7 @@ class StockT0Backtester:
             last = self._last_prices(d)
             self.portfolio.refresh(last)
             self.portfolio.record_equity(day_end=True)
+            result.equity_dates.append(d.isoformat())
             result.equity_curve.append(round(self.portfolio.total_asset, 2))
 
         result.trades = list(self.fills)

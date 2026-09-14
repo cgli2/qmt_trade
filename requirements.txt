@@ -12,3 +12,5 @@ apscheduler>=3.10      # 可选：不装则调度器退化为内置轮询，功�
 # Web API 服务（server/）
 fastapi>=0.110
 uvicorn[standard]>=0.29
+
+duckdb>=1.4.4,<2

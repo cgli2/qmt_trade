@@ -159,10 +159,13 @@ def test_notify() -> None:
         fc = FileChannel(td)
         n10 = Notifier(st, channels=[fc])
         n10.warn("落盘测试", "内容")
-        files = list(Path(td).glob("*.log"))
-        check("生成了日志文件", len(files) == 1, str(files))
-        txt = files[0].read_text(encoding="utf-8") if files else ""
-        check("内容含标题且是 JSON 行", "落盘测试" in txt and txt.strip().startswith("{"))
+        from qmt_trade.storage.runtime import runtime_path
+        store = Database(runtime_path(), schema="jobs")
+        rows = store.query("SELECT title,body FROM business_notifications WHERE title=?", ["落盘测试"])
+        check("通知历史写入数据库", bool(rows))
+        check("通知内容保留", bool(rows) and rows[-1]["body"] == "内容")
+        check("不再创建 JSON 行文件", not list(Path(td).glob("*.log")))
+        store.close()
 
     logger.info("\n[11] 通知 —— KillSwitch 状态变更自动播报")
     mem11 = MemoryChannel()

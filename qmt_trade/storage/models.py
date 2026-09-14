@@ -24,12 +24,12 @@ CREATE TABLE IF NOT EXISTS intents (
     trade_date      TEXT NOT NULL,
     symbol          TEXT NOT NULL,
     action          TEXT NOT NULL,
-    confidence      REAL,
+    confidence      DOUBLE,
     conviction      TEXT,
     payload         TEXT NOT NULL,      -- TradeIntent 完整 JSON
     prompt_hash     TEXT,
     trace_id        TEXT,
-    created_at      REAL NOT NULL
+    created_at      DOUBLE NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_intents_date ON intents(trade_date, symbol);
 
@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS daily_picks (
     rank          INTEGER NOT NULL DEFAULT 0,
     action        TEXT NOT NULL,
     conviction    TEXT,
-    confidence    REAL,
+    confidence    DOUBLE,
     industry      TEXT,
     reason        TEXT,
     votes         TEXT,
@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS daily_picks (
     bear_case     TEXT,               -- 空方核心论据
     debate        TEXT,               -- 多空辩论结构化记录(JSON)
     evidence      TEXT,               -- 支撑证据：因子分位+关键原值(JSON)
-    created_at    REAL NOT NULL
+    created_at    DOUBLE NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_picks_date_sym ON daily_picks(trade_date, symbol);
 CREATE INDEX IF NOT EXISTS idx_picks_symbol ON daily_picks(symbol, trade_date);
@@ -64,17 +64,17 @@ CREATE TABLE IF NOT EXISTS plans (
     symbol          TEXT NOT NULL,
     side            TEXT NOT NULL,
     planned_shares  INTEGER NOT NULL,
-    entry_ref_price REAL,
+    entry_ref_price DOUBLE,
     entry_trigger   TEXT,
-    stop_loss_price REAL,
+    stop_loss_price DOUBLE,
     take_profit     TEXT,
     max_holding_days INTEGER,
     invalidation_checks TEXT,
     status          TEXT NOT NULL DEFAULT 'PENDING',
     payload         TEXT,
     trace_id        TEXT,
-    created_at      REAL NOT NULL,
-    updated_at      REAL NOT NULL
+    created_at      DOUBLE NOT NULL,
+    updated_at      DOUBLE NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_plans_date ON plans(trade_date, status);
 
@@ -87,17 +87,17 @@ CREATE TABLE IF NOT EXISTS orders (
     symbol            TEXT NOT NULL,
     side              TEXT NOT NULL,
     order_type        TEXT NOT NULL,
-    price             REAL,
+    price             DOUBLE,
     volume            INTEGER NOT NULL,
     filled_volume     INTEGER NOT NULL DEFAULT 0,
-    avg_fill_price    REAL,
+    avg_fill_price    DOUBLE,
     status            TEXT NOT NULL,
     gateway_order_id  TEXT,
     signal            TEXT,
     reject_reason     TEXT,
     trace_id          TEXT,
-    created_at        REAL NOT NULL,
-    updated_at        REAL NOT NULL
+    created_at        DOUBLE NOT NULL,
+    updated_at        DOUBLE NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_orders_date ON orders(trade_date, symbol);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
@@ -109,16 +109,16 @@ CREATE TABLE IF NOT EXISTS trades (
     trade_date    TEXT NOT NULL,
     symbol        TEXT NOT NULL,
     side          TEXT NOT NULL,
-    price         REAL NOT NULL,
+    price         DOUBLE NOT NULL,
     volume        INTEGER NOT NULL,
-    amount        REAL NOT NULL,
-    commission    REAL NOT NULL DEFAULT 0,
-    stamp_duty    REAL NOT NULL DEFAULT 0,
-    transfer_fee  REAL NOT NULL DEFAULT 0,
-    slippage_cost REAL NOT NULL DEFAULT 0,
-    total_cost    REAL NOT NULL DEFAULT 0,
-    realized_pnl  REAL,
-    traded_at     REAL NOT NULL,
+    amount        DOUBLE NOT NULL,
+    commission    DOUBLE NOT NULL DEFAULT 0,
+    stamp_duty    DOUBLE NOT NULL DEFAULT 0,
+    transfer_fee  DOUBLE NOT NULL DEFAULT 0,
+    slippage_cost DOUBLE NOT NULL DEFAULT 0,
+    total_cost    DOUBLE NOT NULL DEFAULT 0,
+    realized_pnl  DOUBLE,
+    traded_at     DOUBLE NOT NULL,
     trace_id      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_trades_date ON trades(trade_date, symbol);
@@ -128,11 +128,11 @@ CREATE TABLE IF NOT EXISTS positions (
     symbol          TEXT PRIMARY KEY,
     volume          INTEGER NOT NULL DEFAULT 0,
     available       INTEGER NOT NULL DEFAULT 0,
-    avg_cost        REAL NOT NULL DEFAULT 0,
-    last_price      REAL NOT NULL DEFAULT 0,
+    avg_cost        DOUBLE NOT NULL DEFAULT 0,
+    last_price      DOUBLE NOT NULL DEFAULT 0,
     entry_date      TEXT,
-    highest_price   REAL NOT NULL DEFAULT 0,
-    stop_loss_price REAL,
+    highest_price   DOUBLE NOT NULL DEFAULT 0,
+    stop_loss_price DOUBLE,
     stop_loss_type  TEXT,
     take_profit     TEXT,
     max_holding_days INTEGER,
@@ -141,20 +141,20 @@ CREATE TABLE IF NOT EXISTS positions (
     origin_shares   INTEGER DEFAULT 0,
     plan_id         TEXT,
     industry        TEXT,
-    updated_at      REAL NOT NULL
+    updated_at      DOUBLE NOT NULL
 );
 
 -- 账户每日快照
 CREATE TABLE IF NOT EXISTS account_snapshots (
     trade_date    TEXT PRIMARY KEY,
-    total_asset   REAL NOT NULL,
-    cash          REAL NOT NULL,
-    market_value  REAL NOT NULL,
-    realized_pnl  REAL NOT NULL DEFAULT 0,
-    unrealized_pnl REAL NOT NULL DEFAULT 0,
+    total_asset   DOUBLE NOT NULL,
+    cash          DOUBLE NOT NULL,
+    market_value  DOUBLE NOT NULL,
+    realized_pnl  DOUBLE NOT NULL DEFAULT 0,
+    unrealized_pnl DOUBLE NOT NULL DEFAULT 0,
     position_count INTEGER NOT NULL DEFAULT 0,
     regime        TEXT,
-    created_at    REAL NOT NULL
+    created_at    DOUBLE NOT NULL
 );
 
 -- 风控事件
@@ -168,7 +168,7 @@ CREATE TABLE IF NOT EXISTS risk_events (
     message     TEXT,
     detail      TEXT,
     trace_id    TEXT,
-    created_at  REAL NOT NULL
+    created_at  DOUBLE NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_risk_date ON risk_events(trade_date, gate);
 
@@ -182,11 +182,11 @@ CREATE TABLE IF NOT EXISTS llm_calls (
     response      TEXT NOT NULL,
     input_tokens  INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
-    cost_cny      REAL NOT NULL DEFAULT 0,
+    cost_cny      DOUBLE NOT NULL DEFAULT 0,
     latency_ms    INTEGER NOT NULL DEFAULT 0,
     trade_date    TEXT,
     trace_id      TEXT,
-    created_at    REAL NOT NULL
+    created_at    DOUBLE NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_llm_date ON llm_calls(trade_date);
 
@@ -198,11 +198,11 @@ CREATE TABLE IF NOT EXISTS experiences (
     situation     TEXT NOT NULL,
     action        TEXT,
     outcome       TEXT,
-    pnl_pct       REAL,
+    pnl_pct       DOUBLE,
     lesson        TEXT NOT NULL,
     tags          TEXT,
     embedding     TEXT,
-    created_at    REAL NOT NULL
+    created_at    DOUBLE NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_exp_symbol ON experiences(symbol);
 
@@ -211,7 +211,7 @@ CREATE TABLE IF NOT EXISTS system_state (
     key         TEXT PRIMARY KEY,
     value       TEXT NOT NULL,
     reason      TEXT,
-    updated_at  REAL NOT NULL
+    updated_at  DOUBLE NOT NULL
 );
 
 -- 对账日志
@@ -220,18 +220,19 @@ CREATE TABLE IF NOT EXISTS reconcile_logs (
     trade_date  TEXT NOT NULL,
     passed      INTEGER NOT NULL,
     detail      TEXT,
-    created_at  REAL NOT NULL
+    created_at  DOUBLE NOT NULL
 );
 
 -- 任务执行历史（每次调度一行；system_state 只存最后一次，观察期证据链靠这张表）
+CREATE SEQUENCE IF NOT EXISTS job_runs_id_seq START 1;
 CREATE TABLE IF NOT EXISTS job_runs (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    id          BIGINT PRIMARY KEY DEFAULT nextval('job_runs_id_seq'),
     job_name    TEXT NOT NULL,
     trade_date  TEXT NOT NULL,
     status      TEXT NOT NULL,          -- OK / FAIL / SKIP
     reason      TEXT,
-    elapsed     REAL,
-    started_at  REAL NOT NULL
+    elapsed     DOUBLE,
+    started_at  DOUBLE NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_job_runs_date ON job_runs(trade_date, job_name);
 
@@ -243,11 +244,11 @@ CREATE TABLE IF NOT EXISTS news (
     content       TEXT,
     source        TEXT,
     url           TEXT,
-    publish_time  REAL NOT NULL,
+    publish_time  DOUBLE NOT NULL,
     category      TEXT,
-    importance    REAL DEFAULT 0,
-    sentiment     REAL,
-    created_at    REAL NOT NULL
+    importance    DOUBLE DEFAULT 0,
+    sentiment     DOUBLE,
+    created_at    DOUBLE NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_news_time ON news(publish_time);
 CREATE INDEX IF NOT EXISTS idx_news_symbol ON news(symbol, publish_time);
@@ -276,7 +277,7 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
 def _migrate(db: Database) -> None:
     for table, col, typedef in _MIGRATIONS:
         try:
-            cols = {r["name"] for r in db.query(f"PRAGMA table_info({table})")}
+            cols = {r["column_name"] for r in db.query("SELECT column_name FROM information_schema.columns WHERE table_schema=? AND table_name=?", (db.schema, table))}
             if cols and col not in cols:
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typedef}")
                 logger.info("schema 迁移: %s 增列 %s", table, col)
@@ -587,29 +588,34 @@ class PicksRepo(BaseRepo):
 
     def add(self, *, trade_date: date | str, symbol: str, payload: str, **kw) -> str:
         pid = new_id("pck_")
-        self.db.insert(
-            "daily_picks",
-            {
-                "id": pid,
-                "trade_date": _today(trade_date),
-                "symbol": symbol,
-                "rank": int(kw.get("rank", 0) or 0),
-                "action": kw.get("action", "BUY"),
-                "conviction": kw.get("conviction"),
-                "confidence": kw.get("confidence"),
-                "industry": kw.get("industry"),
-                "reason": kw.get("reason"),
-                "votes": kw.get("votes"),
-                "intent_id": kw.get("intent_id"),
-                "payload": payload,
-                "bull_case": kw.get("bull_case"),
-                "bear_case": kw.get("bear_case"),
-                "debate": kw.get("debate"),
-                "evidence": kw.get("evidence"),
-                "created_at": time.time(),
-            },
-            replace=True,
-        )
+        d = _today(trade_date)
+        row = {
+            "id": pid,
+            "trade_date": d,
+            "symbol": symbol,
+            "rank": int(kw.get("rank", 0) or 0),
+            "action": kw.get("action", "BUY"),
+            "conviction": kw.get("conviction"),
+            "confidence": kw.get("confidence"),
+            "industry": kw.get("industry"),
+            "reason": kw.get("reason"),
+            "votes": kw.get("votes"),
+            "intent_id": kw.get("intent_id"),
+            "payload": payload,
+            "bull_case": kw.get("bull_case"),
+            "bear_case": kw.get("bear_case"),
+            "debate": kw.get("debate"),
+            "evidence": kw.get("evidence"),
+            "created_at": time.time(),
+        }
+        # daily_picks 是 id 主键 + (trade_date,symbol) 唯一索引的双约束表。
+        # DuckDB 的 INSERT OR REPLACE 缺 conflict target 时在「绑定期」就报错，
+        # 连首次无冲突插入都失败——生产因此静默停写 26 天（异常被 _store_picks
+        # 的 except Exception 吞成 warning）。按业务键先删后插实现「按天覆盖」，
+        # 与 clear_date 语义一致且幂等，彻底避开双约束绑定错误。
+        with self.db.transaction():
+            self.db.delete("daily_picks", "trade_date=? AND symbol=?", (d, symbol))
+            self.db.insert("daily_picks", row)
         return pid
 
     def clear_date(self, trade_date: date | str) -> None:

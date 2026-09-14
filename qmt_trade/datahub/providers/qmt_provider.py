@@ -445,49 +445,24 @@ class QmtProvider(DataProvider):
     # 仅缺失 / 过期标的才走 QMT（其本身也是增量下载）。财务为不可变历史，TTL 默认
     # 1 天（对齐 datahub.cache.fundamental_ttl）——既"下载一次复用"，又能在新
     # 财报发布后自然刷新。保留原始多期数据（而非仅最新一期）以保证 PIT 切片正确。
-    def _fin_dir(self) -> Path:
-        d = Path(self._fin_cache_dir) if self._fin_cache_dir else (
-            _PROJ_ROOT / "data" / "fundamentals")
-        d.mkdir(parents=True, exist_ok=True)
-        return d
-
-    def _fin_path(self, sym: str, table: str) -> Path:
-        safe = sym.replace(".", "_")  # 文件名更友好（规避 Windows 保留字符）
-        return self._fin_dir() / f"{safe}__{table}.parquet"
-
     def _fin_fresh(self, sym: str) -> bool:
-        """磁盘缓存齐全且未过期（TTL 内）则返回 True。"""
-        if not self._fin_ttl:
-            return False  # ttl=0 → 视作不缓存，每次走 QMT
-        for t in self._FIN_TABLES:
-            p = self._fin_path(sym, t)
-            if not p.exists():
-                return False
-            if (time.time() - p.stat().st_mtime) > self._fin_ttl:
-                return False
-        return True
+        from ...storage.cache import provider_cache
+        cache = provider_cache(self)
+        return all(cache.fresh("qmt_" + t, sym, self._fin_ttl) for t in self._FIN_TABLES)
 
     def _load_symbol_raw(self, sym: str) -> dict | None:
+        from ...storage.cache import provider_cache
         if not self._fin_fresh(sym):
             return None
-        raw: dict = {}
-        for t in self._FIN_TABLES:
-            try:
-                df = pd.read_parquet(self._fin_path(sym, t))
-            except Exception:  # noqa: BLE001
-                return None
-            if df is not None and not getattr(df, "empty", True):
-                raw[t] = df
-        return raw or None
+        cache = provider_cache(self)
+        raw = {t: cache.get("qmt_" + t, sym, self._fin_ttl) for t in self._FIN_TABLES}
+        return {t: df for t, df in raw.items() if df is not None and not df.empty} or None
 
     def _save_symbol_raw(self, sym: str, raw: dict) -> None:
-        for t, df in raw.items():
-            if df is None or getattr(df, "empty", True):
-                continue
-            try:
-                df.to_parquet(self._fin_path(sym, t), index=False)
-            except Exception as exc:  # noqa: BLE001 - 单票写盘失败不影响整体
-                logger.debug("财务缓存写盘失败 %s/%s: %s", sym, t, exc)
+        from ...storage.cache import provider_cache
+        cache = provider_cache(self)
+        for table, frame in raw.items():
+            cache.put("qmt_" + table, sym, frame)
 
     def _download_raw(
         self,

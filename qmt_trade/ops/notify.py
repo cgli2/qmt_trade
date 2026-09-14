@@ -137,7 +137,7 @@ class MemoryChannel(Channel):
 
 
 class FileChannel(Channel):
-    """按天追加到文件，断网时的最后归档。"""
+    """兼容旧频道名称；通知历史现在持久化到 DuckDB。"""
 
     name = "file"
 
@@ -145,14 +145,17 @@ class FileChannel(Channel):
         self.dir = Path(dir_path)
 
     def send(self, msg: Message) -> None:
-        self.dir.mkdir(parents=True, exist_ok=True)
-        f = self.dir / f"{msg.at:%Y-%m-%d}.log"
-        with f.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps({
-                "at": msg.at.isoformat(), "level": msg.level.name,
-                "title": msg.title, "body": msg.body,
-                "fields": {k: str(v) for k, v in msg.fields.items()},
-                "trace_id": msg.trace_id}, ensure_ascii=False) + "\n")
+        import uuid
+        from ..storage.db import Database
+        from ..storage.runtime import runtime_path
+        db = Database(runtime_path(), schema="jobs")
+        try:
+            db.execute("CREATE TABLE IF NOT EXISTS business_notifications (id VARCHAR PRIMARY KEY, created VARCHAR, level VARCHAR, title VARCHAR, body VARCHAR, fields VARCHAR, trace_id VARCHAR)")
+            db.insert("business_notifications", {"id": uuid.uuid4().hex, "created": msg.at.isoformat(),
+                      "level": msg.level.name, "title": msg.title, "body": msg.body,
+                      "fields": {k: str(v) for k,v in msg.fields.items()}, "trace_id": msg.trace_id})
+        finally:
+            db.close()
 
 
 class _WebhookChannel(Channel):

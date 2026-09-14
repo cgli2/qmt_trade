@@ -151,6 +151,11 @@ class Settings:
             raise ConfigError(f"配置文件不存在: {path}")
         raw = _load_yaml_mapping(path)
         raw = _load_and_migrate_strategy_configs(path, raw)
+        if path.resolve() == DEFAULT_SETTINGS.resolve():
+            from ..storage.configuration import read_active
+            published = read_active("settings", PROJECT_ROOT / str(raw.get("app", {}).get("data_dir", "data")))
+            if published is not None:
+                raw = _deep_merge(raw, published)
         inst = cls(raw, env_overlay=env_overlay)
         inst._path = path
         return inst

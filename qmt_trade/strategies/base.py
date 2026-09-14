@@ -69,6 +69,7 @@ class StrategyConfig:
 @dataclass
 class StrategyResult:
     equity_curve: list[float] = field(default_factory=list)
+    equity_dates: list[str] = field(default_factory=list)
     trades: list = field(default_factory=list)          # 逐笔成交（Fill）
     closed_trades: list = field(default_factory=list)   # 平仓明细
     open_positions: list = field(default_factory=list)  # 期末未平仓快照
@@ -114,12 +115,15 @@ class StandaloneBacktester:
         result = StrategyResult()
         logger.info("策略 %s 回测启动 %s ~ %s（标的 %d）", self.sid, start, end, len(self.universe))
         for i, d in enumerate(days[:-1]):
+            if getattr(self, "progress_callback", None):
+                self.progress_callback(days.index(d), len(days))
             next_day = days[i + 1]
             self.portfolio.mark_t1(next_day)
             self._on_day(d, next_day, instr_map)
             last = self._last_prices(d)
             self.portfolio.refresh(last)
             self.portfolio.record_equity(day_end=True)
+            result.equity_dates.append(d.isoformat())
             result.equity_curve.append(round(self.portfolio.total_asset, 2))
         result.trades = list(self.fills)
         result.closed_trades = list(self.portfolio.closed_trades)

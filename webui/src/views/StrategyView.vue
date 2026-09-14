@@ -3,6 +3,7 @@ import { computed, onMounted, ref, watch } from "vue";
 import api from "@/api";
 import { useApp } from "@/store";
 import { pushToast, tryReq } from "@/toast";
+import ParameterForm from "@/components/ParameterForm.vue";
 import Modal from "@/components/Modal.vue";
 
 const app = useApp();
@@ -19,18 +20,20 @@ const catalog = ref<any>(null);
 const stratDetail = ref<any>(null);
 const management = ref<any>({ definitions: [], instances: [] });
 const instance = ref<any>(null);
-const paramsText = ref("{}");
+const params = ref<Record<string, any>>({});
+const parameterSchema = computed(() => management.value.definitions.find((s: any) => s.id === instance.value?.strategy_id)?.schema || []);
 const instanceName = ref("");
 const instanceNote = ref("");
 
 async function loadManagement() { management.value = await tryReq(() => api.strategyManagement(app.mode)) || { definitions: [], instances: [] }; }
-function newInstance(s: any) { instance.value = { strategy_id: s.id }; instanceName.value = s.name; instanceNote.value = ""; paramsText.value = JSON.stringify(s.params || {}, null, 2); }
-function editInstance(i: any) { instance.value = i; instanceName.value = i.name; instanceNote.value = i.draft?.note || ""; paramsText.value = JSON.stringify(i.draft?.params || i.versions?.find((v: any) => v.id === i.active_version)?.params || {}, null, 2); }
-function formBody() { let params: any; try { params = JSON.parse(paramsText.value); } catch { pushToast("参数必须是合法 JSON 对象", "error"); return null; } if (!params || Array.isArray(params) || typeof params !== "object") { pushToast("参数必须是 JSON 对象", "error"); return null; } return { instance_id: instance.value?.id, strategy_id: instance.value?.strategy_id, name: instanceName.value, note: instanceNote.value, params }; }
+function newInstance(s: any) { instance.value = { strategy_id: s.id }; instanceName.value = s.name; instanceNote.value = ""; params.value = structuredClone(s.params || {}); }
+function editInstance(i: any) { instance.value = i; instanceName.value = i.name; instanceNote.value = i.draft?.note || ""; params.value = structuredClone(i.draft?.params || i.versions?.find((v: any) => v.id === i.active_version)?.params || {}); }
+function formBody() { return { instance_id: instance.value?.id, strategy_id: instance.value?.strategy_id, name: instanceName.value, note: instanceNote.value, params: params.value }; }
 async function saveDraft() { const body = formBody(); if (!body) return; const r = await tryReq(() => api.strategyDraft(body, app.mode), "草稿已保存"); if (r?.instance) { instance.value = r.instance; await loadManagement(); } }
 async function publish() { const body = formBody(); if (!body) return; if (!body.instance_id) { await saveDraft(); body.instance_id = instance.value?.id; } const r = await tryReq(() => api.strategyPublish(body, app.mode), "版本已发布"); if (r?.instance) { instance.value = r.instance; await loadManagement(); } }
 async function rollback(i: any, v: any) { const r = await tryReq(() => api.strategyRollback(i.id, v.id, app.mode), `已回滚至 ${v.id}`); if (r?.instance) { instance.value = r.instance; await loadManagement(); } }
 async function toggle(i: any) { const r = await tryReq(() => api.strategyEnabled(i.id, !i.enabled, app.mode), i.enabled ? "实例已停用" : "实例已启用"); if (r) loadManagement(); }
+async function removeInstance(i: any) { if (!confirm(`确定删除实例「${i.name}」及其全部版本？此操作不可恢复。`)) return; const r = await tryReq(() => api.strategyDelete(i.id, app.mode), "实例已删除"); if (r) { if (instance.value?.id === i.id) instance.value = null; await loadManagement(); } }
 
 async function loadCatalog() {
   catalog.value = await tryReq(() => api.strategyCatalog());
@@ -124,7 +127,7 @@ watch(() => app.mode, () => { load(); loadManagement(); });
         <div>
           <h4>运行实例</h4>
           <table><thead><tr><th>实例</th><th>版本</th><th>状态</th><th></th></tr></thead><tbody>
-            <tr v-for="i in management.instances" :key="i.id"><td><b>{{ i.name }}</b><div class="tiny muted">{{ i.strategy_id }}</div></td><td>{{ i.active_version || "未发布" }}</td><td><span class="badge" :class="i.enabled ? 'ok' : 'muted'">{{ i.enabled ? "启用" : "停用" }}</span></td><td><button class="btn sm ghost" @click="editInstance(i)">编辑</button> <button class="btn sm ghost" @click="toggle(i)">{{ i.enabled ? "停用" : "启用" }}</button></td></tr>
+            <tr v-for="i in management.instances" :key="i.id"><td><b>{{ i.name }}</b><div class="tiny muted">{{ i.strategy_id }}</div></td><td>{{ i.active_version || "未发布" }}</td><td><span class="badge" :class="i.enabled ? 'ok' : 'muted'">{{ i.enabled ? "启用" : "停用" }}</span></td><td><button class="btn sm ghost" @click="editInstance(i)">编辑</button> <button class="btn sm ghost" @click="toggle(i)">{{ i.enabled ? "停用" : "启用" }}</button> <button class="btn sm ghost danger" @click="removeInstance(i)">删除</button></td></tr>
             <tr v-if="!management.instances?.length"><td colspan="4" class="muted">暂无实例；请从左侧已注册策略创建</td></tr>
           </tbody></table>
         </div>
@@ -256,10 +259,11 @@ watch(() => app.mode, () => { load(); loadManagement(); });
     <Modal v-if="instance" :title="`${instance.id ? '编辑' : '新建'}运行实例 · ${instance.strategy_id}`" @close="instance = null">
       <div class="tiny muted" style="margin-bottom:10px">此处编辑的是运行实例的独立草稿，不会修改策略默认配置。发布后才生成可回滚的版本。</div>
       <label>实例名称</label><input v-model="instanceName" placeholder="实例名称" />
-      <label style="display:block;margin-top:10px">参数（JSON 对象）</label><textarea v-model="paramsText" rows="10" style="width:100%;font-family:monospace"></textarea>
+      <ParameterForm v-model="params" :schema="parameterSchema" />
+      <p class="muted">{{ instance.running_version === instance.active_version && instance.active_version ? '已生效：' + instance.running_version : instance.active_version ? '待生效：' + instance.active_version : '草稿尚未应用' }}</p>
       <label style="display:block;margin-top:10px">备注</label><input v-model="instanceNote" placeholder="本次配置说明" />
       <div v-if="instance.versions?.length" style="margin-top:14px"><h4>版本历史</h4><div v-for="v in instance.versions" :key="v.id" class="row" style="margin:5px 0"><span class="pill">{{ v.id }}</span><span class="tiny muted">{{ v.note || '无备注' }}</span><span class="spacer"></span><b v-if="v.id === instance.active_version" class="tiny">当前</b><button v-else class="btn sm ghost" @click="rollback(instance, v)">回滚</button></div></div>
-      <template #actions><button class="btn ghost" @click="instance = null">关闭</button><button class="btn ghost" @click="saveDraft">保存草稿</button><button class="btn" @click="publish">发布版本</button></template>
+      <template #actions><button class="btn ghost" @click="instance = null">关闭</button><button class="btn ghost" @click="saveDraft">保存草稿</button><button class="btn" @click="publish">应用配置</button></template>
     </Modal>
 
     <Modal v-if="stratDetail" :title="stratDetail.name" @close="stratDetail = null">

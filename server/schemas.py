@@ -100,6 +100,10 @@ class StrategyInstanceStateIn(BaseModel):
 
 # ---------------------------------------------------------------- 回测
 class BacktestIn(BaseModel):
+    strategy: str = "balanced"
+    instance_id: Optional[str] = None
+    version_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
     start: str
     end: Optional[str] = None
     cash: float = 1_000_000.0

@@ -58,6 +58,13 @@ function q(mode?: string) {
 }
 
 export const api = {
+  strategies: () => req("GET", "/strategies"),
+  backtestReport: (id: string) => req("GET", `/backtests/${id}/report`),
+  backtestTrades: (id: string, offset=0) => req("GET", `/backtests/${id}/trades`, undefined, {offset, limit:50}),
+  cancelJob: (id: string) => req("POST", `/jobs/${id}/cancel`),
+  retryJob: (id: string) => req("POST", `/jobs/${id}/retry`),
+  notifications: () => req("GET", "/notifications"),
+  readNotification: (id: string) => req("POST", `/notifications/${id}/read`),
   // ---------------- 系统 / 总览 / 风控总开关 / 调度 / 密钥
   overview: (mode?: string) => req("GET", "/overview", undefined, q(mode)),
   health: (mode?: string, notify = false) =>
@@ -136,6 +143,7 @@ export const api = {
   strategyPublish: (body: any, mode?: string) => req("POST", "/strategy/instances/publish", body, q(mode)),
   strategyRollback: (id: string, version: string, mode?: string) => req("POST", `/strategy/instances/${id}/rollback/${version}`, undefined, q(mode)),
   strategyEnabled: (id: string, enabled: boolean, mode?: string) => req("POST", `/strategy/instances/${id}/enabled`, { enabled }, q(mode)),
+  strategyDelete: (id: string, mode?: string) => req("DELETE", `/strategy/instances/${id}`, undefined, q(mode)),
   strategyPool: (mode?: string) => req("GET", "/strategy/pool", undefined, q(mode)),
   strategyRebalance: (mode: string) => req("POST", "/strategy/rebalance", undefined, q(mode)),
   strategyEvolve: (mode: string, date?: string) =>

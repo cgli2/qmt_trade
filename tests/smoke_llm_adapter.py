@@ -324,6 +324,7 @@ def test_health() -> None:
 def test_manager_basic() -> None:
     logger.info("\n[10] LLMManager 场景选模 + 缓存 + 成本")
     m = LLMManager.from_file()
+    m._adapter_for = lambda mid: MockLLM()
     r = m.complete("SYMBOL:600000 深度研判", scene="market_analysis", tag="t")
     check("场景选模返回响应", r is not None and bool(r.content), r.model)
     check("场景解析到推理模型", r.model == "deepseek-reasoner", r.model)
@@ -451,7 +452,7 @@ def test_agent_degrade() -> None:
     logger.info("\n[14] 模型全挂 → Agent 降级规则路径（P5 闭环）")
     from datetime import date
 
-    from qmt_trade.brain.graph import build_brain
+    from qmt_trade.brain.graph import BrainGraph
     from qmt_trade.brain.llm.client import LLMClient
     from qmt_trade.brain.state import PortfolioSnapshot
     from qmt_trade.core.config import Settings as S
@@ -473,8 +474,7 @@ def test_agent_degrade() -> None:
         def embed(self, text):
             return None
 
-    brain = build_brain(settings, hub, use_llm=True)
-    brain.client = LLMClient(DeadAdapter(), cache_enabled=False)
+    brain = BrainGraph(settings, hub, LLMClient(DeadAdapter(), cache_enabled=False), use_llm=True)
     for agent in getattr(brain, "analysts", []):
         agent.client = brain.client
 

@@ -2,16 +2,22 @@
 // 交易执行：模拟盘 / 实盘 双 Tab，各自独立账本、互不干扰。
 // - 模拟盘(paper)：真实行情 + 模拟撮合，用于验证策略有效性；账本可随时重置。
 // - 实盘(live)：直连券商(QMT)；下单/结算/对账与模拟盘同链路，均须穿过三道风控闸门。
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import api from "@/api";
+import { useApp } from "@/store";
 import { pushToast, tryReq } from "@/toast";
 import Modal from "@/components/Modal.vue";
 import SymbolSelect from "@/components/SymbolSelect.vue";
 import SymbolDetailModal from "@/components/SymbolDetailModal.vue";
 
-const props = defineProps<{ mode: "paper" | "live" }>();
+defineProps<{ mode: "paper" | "live" }>();
+const app = useApp();
+// 模式以全局 store 为准（响应式），切换时无需重建组件，避免整页卸载/重挂导致的卡顿
+const props = reactive({ get mode(): "paper" | "live" { return app.mode; } });
 const isLive = computed(() => props.mode === "live");
 
+let requestGeneration = 0;
+onUnmounted(() => { requestGeneration++; });
 const loading = ref(false);
 const positions = ref<any[]>([]);
 const orders = ref<any[]>([]);
@@ -38,6 +44,7 @@ async function load() {
 }
 
 async function loadPaper() {
+  const generation = ++requestGeneration;
   loading.value = true;
   const [p, o, i, s] = await Promise.all([
     tryReq(() => api.positions("paper")),
@@ -45,6 +52,7 @@ async function loadPaper() {
     tryReq(() => api.intents("paper", dateFilter.value || undefined)),
     tryReq(() => api.symbols("paper")),
   ]);
+  if (generation !== requestGeneration) return;
   positions.value = p?.positions || [];
   orders.value = sortOrders(o?.orders || []);
   intents.value = i?.intents || [];
@@ -53,6 +61,7 @@ async function loadPaper() {
 }
 
 async function loadLive() {
+  const generation = ++requestGeneration;
   loading.value = true;
   const [b, o, s] = await Promise.all([
     // QMT 未连接时网关会重试连接（约 30s+），超时兜底避免页面一直转圈
@@ -61,6 +70,7 @@ async function loadLive() {
     tryReq(() => api.orders("live", dateFilter.value || undefined)),
     tryReq(() => api.symbols("live")),
   ]);
+  if (generation !== requestGeneration) return;
   broker.value = b || { available: false, message: "券商信息加载失败" };
   orders.value = sortOrders(o?.orders || []);
   symbols.value = s?.symbols || [];
@@ -94,81 +104,48 @@ async function ackRecon() {
   if (r) loadRecon();
 }
 
-async function resetLedger() {
-  if (!confirm("确认重置模拟盘账本？\n将清空全部模拟持仓，账户现金回到初始资金；订单/意图记录保留作历史留痕。")) return;
-  const r = await tryReq(() => api.positionsReset("paper"), "模拟账本已重置");
-  if (r) { recon.value = null; loadPaper(); }
-}
-
 function openOrder() {
+  orderDlg.value = { symbol: "", action: "BUY", shares: 0, price: null, confidence: 0.6, conviction: "MEDIUM", stop_loss_type: "percent", stop_loss_value: 0.05, reason: "" };
   orderResult.value = null;
-  orderDlg.value = {
-    symbol: symbols.value[0]?.symbol || "", action: "BUY", shares: 0, price: null,
-    confidence: 0.6, conviction: "MEDIUM",
-    reason: isLive.value ? "Web 控制台手动实盘下单" : "Web 控制台手动模拟下单",
-    stop_loss_type: "percent", stop_loss_value: 0.08,
-  };
 }
 
 async function submitOrder() {
-  const o = orderDlg.value;
-  if (!o.symbol) { pushToast("请选择标的", "err"); return; }
-  if (isLive.value && !confirm(
-    `⚠️ 实盘真实下单确认\n\n${o.action === "BUY" ? "买入" : "卖出"} ${o.symbol} ${Number(o.shares) || "（由仓位管理器计算）"} 股\n\n订单将经 QMT 发送到券商账户（仍需通过三道风控闸门）。确认执行？`
-  )) return;
-  loading.value = true;
-  const r = await tryReq(() => api.submitIntent({
-    ...o,
-    shares: Number(o.shares) || 0,
-    price: o.price ? Number(o.price) : null,
-    confidence: Number(o.confidence),
-    stop_loss_value: Number(o.stop_loss_value),
+  const d = orderDlg.value;
+  if (!d?.symbol) return pushToast("请选择标的", "warn");
+  const r = await tryReq(() => api.order({
+    symbol: d.symbol, action: d.action, shares: Number(d.shares) || 0,
+    price: d.price != null && d.price !== "" ? Number(d.price) : null,
+    confidence: Number(d.confidence) || 0.6, conviction: d.conviction,
+    stop_loss_type: d.stop_loss_type, stop_loss_value: Number(d.stop_loss_value) || 0.05,
+    reason: d.reason || "手动下单",
   }, props.mode));
-  loading.value = false;
-  if (r) {
-    orderResult.value = r;
-    pushToast(r.ok ? "订单已通过风控并成交" : `被拦截：${r.rejected_by || r.reason}`, r.ok ? "ok" : "err");
-    load();
-  }
-}
-
-// 盘后结算 = review 任务：收盘权益入账(record_equity) + 账本落库 + 复盘。
-// 后端为异步任务，这里提交后轮询 /jobs/{id} 直到终态。
-async function settle() {
-  const tag = isLive.value ? "实盘" : "模拟盘";
-  if (!confirm(`确认对${tag}执行盘后结算？\n将记录当日收盘权益、刷新账本并生成复盘。`)) return;
-  loading.value = true;
-  const r = await tryReq(() => api.strategyReview(props.mode, dateFilter.value || undefined));
-  loading.value = false;
-  if (!r?.job_id) return;
-  pushToast(`结算任务已提交（${r.job_id}），后台运行中…`, "ok");
-  let tries = 0;
-  const timer = setInterval(async () => {
-    tries += 1;
-    const j = await tryReq(() => api.job(r.job_id));
-    if (!j || tries > 150) { clearInterval(timer); return; }
-    if (j.status === "done") {
-      clearInterval(timer);
-      pushToast("盘后结算完成", "ok");
-      load();
-    } else if (j.status === "error") {
-      clearInterval(timer);
-      pushToast(`结算失败：${j.error}`, "err");
-    }
-  }, 2000);
+  if (r) { orderResult.value = r; load(); }
 }
 
 async function runPlan() {
-  loading.value = true;
-  const r = await tryReq(() => api.runPlan("paper", dateFilter.value || undefined));
-  loading.value = false;
-  if (r) { planResult.value = r; showPlan.value = true; loadPaper(); }
+  const r = await tryReq(() => api.runPlan(props.mode));
+  if (r) { planResult.value = r; showPlan.value = true; load(); }
+}
+
+async function settle() {
+  if (typeof api.settle !== 'function') {
+    pushToast('盘后结算功能暂未开放', 'warning');
+    return;
+  }
+  const r = await tryReq(() => api.settle(props.mode), "结算完成");
+  if (r) load();
+}
+
+async function resetLedger() {
+  if (!confirm("确认重置模拟账本？将清空所有模拟持仓与订单记录。")) return;
+  const r = await tryReq(() => api.resetPaper(), "模拟账本已重置");
+  if (r) load();
 }
 
 function pnlColor(v: any) {
   const n = Number(v);
-  if (!n) return "";
-  return n > 0 ? "color:var(--danger)" : "color:var(--ok)";
+  if (Number.isNaN(n) || n === 0) return {};
+  return { color: n > 0 ? "var(--danger)" : "var(--ok)" };
 }
 
 function fmtNum(v: any, digits = 2) {
@@ -247,17 +224,18 @@ watch(() => props.mode, () => { recon.value = null; symbolDlg.value = null; load
           <h3>📝 订单 <span class="sub">{{ orders.length }} 条</span></h3>
           <div style="max-height:340px; overflow:auto">
             <table>
-              <thead><tr><th>标的</th><th>方向</th><th>数量</th><th>价格</th><th>状态</th><th>时间</th></tr></thead>
+              <thead><tr><th>标的</th><th>名称</th><th>方向</th><th>数量</th><th>价格</th><th>状态</th><th>时间</th></tr></thead>
               <tbody>
                 <tr v-for="(o, i) in orders" :key="i">
                   <td><a class="sym-link" @click="openSymbol(o.symbol)">{{ o.symbol }}</a></td>
+                  <td class="tiny">{{ o.name || "-" }}</td>
                   <td><span class="badge" :class="String(o.side).includes('BUY') ? 'danger' : 'ok'">{{ o.side }}</span></td>
                   <td class="pill">{{ o.shares ?? o.volume }}</td>
                   <td class="pill">{{ o.price != null ? Number(o.price).toFixed(3) : "-" }}</td>
                   <td><span class="badge muted">{{ o.status }}</span></td>
                   <td class="tiny muted">{{ fmtTs(o.created_at || o.trade_date) }}</td>
                 </tr>
-                <tr v-if="!orders.length"><td colspan="6" class="muted">无订单</td></tr>
+                <tr v-if="!orders.length"><td colspan="7" class="muted">无订单</td></tr>
               </tbody>
             </table>
           </div>
@@ -340,17 +318,18 @@ watch(() => props.mode, () => { recon.value = null; symbolDlg.value = null; load
         <h3>📝 实盘订单（本地账本） <span class="sub">{{ orders.length }} 条{{ dateFilter ? ` · ${dateFilter}` : " · 最近 50 条" }}</span></h3>
         <div style="max-height:340px; overflow:auto">
           <table>
-            <thead><tr><th>标的</th><th>方向</th><th>数量</th><th>价格</th><th>状态</th><th>时间</th></tr></thead>
+            <thead><tr><th>标的</th><th>名称</th><th>方向</th><th>数量</th><th>价格</th><th>状态</th><th>时间</th></tr></thead>
             <tbody>
               <tr v-for="(o, i) in orders" :key="i">
                 <td><a class="sym-link" @click="openSymbol(o.symbol)">{{ o.symbol }}</a></td>
+                <td class="tiny">{{ o.name || "-" }}</td>
                 <td><span class="badge" :class="String(o.side).includes('BUY') ? 'danger' : 'ok'">{{ o.side }}</span></td>
                 <td class="pill">{{ o.shares ?? o.volume }}</td>
                 <td class="pill">{{ o.price != null ? Number(o.price).toFixed(3) : "-" }}</td>
                 <td><span class="badge muted">{{ o.status }}</span></td>
                 <td class="tiny muted">{{ fmtTs(o.created_at || o.trade_date) }}</td>
               </tr>
-              <tr v-if="!orders.length"><td colspan="6" class="muted">无订单</td></tr>
+              <tr v-if="!orders.length"><td colspan="7" class="muted">无订单</td></tr>
             </tbody>
           </table>
         </div>
@@ -396,7 +375,8 @@ watch(() => props.mode, () => { recon.value = null; symbolDlg.value = null; load
         </div>
         <div class="field"><label>止损方式</label>
           <select v-model="orderDlg.stop_loss_type">
-            <option value="percent">固定百分比</option><option value="structure">结构止损</option>
+            <option value="percent">固定百分比</option>
+            <option value="structure">结构止损</option>
           </select>
         </div>
         <div class="field"><label>止损值</label><input v-model="orderDlg.stop_loss_value" type="number" step="0.01" /></div>
@@ -434,14 +414,19 @@ watch(() => props.mode, () => { recon.value = null; symbolDlg.value = null; load
 </template>
 
 <style scoped>
-.tv-tabs { display: flex; gap: 12px; margin-bottom: 16px; }
+.tv-tabs { display: flex; gap: 0; margin-bottom: 20px; border-bottom: 2px solid var(--border); }
 .tv-tab {
-  flex: 1; padding: 12px 16px; border: 1px solid var(--border); border-radius: var(--radius);
-  background: var(--bg-elev); font-weight: 600; font-size: 14px; transition: all .15s;
+  flex: 0 0 auto; padding: 12px 24px; border: none; border-bottom: 3px solid transparent;
+  background: transparent; font-weight: 600; font-size: 15px; transition: all .15s;
+  position: relative; margin-bottom: -2px;
 }
-.tv-tab small { display: block; color: var(--text-2); font-weight: 400; font-size: 12px; margin-top: 3px; }
-.tv-tab:hover { border-color: var(--primary); }
-.tv-tab.active { border-color: var(--primary); background: color-mix(in srgb, var(--primary) 9%, var(--bg-elev)); }
+.tv-tab small { display: block; color: var(--text-2); font-weight: 400; font-size: 12px; margin-top: 4px; }
+.tv-tab:hover { color: var(--primary); }
+.tv-tab.active { 
+  color: var(--primary); 
+  border-bottom-color: var(--primary); 
+  background: linear-gradient(to bottom, transparent, color-mix(in srgb, var(--primary) 5%, transparent));
+}
 .asset-tile { background: var(--bg-2); border-radius: 10px; padding: 12px 14px; }
 .asset-tile .k { color: var(--text-2); font-size: 12px; margin-bottom: 4px; }
 .asset-tile .v { font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }

@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 import server.context as ctx
 from server.schemas import EvolveIn, StrategyInstanceStateIn, StrategyVersionIn
+from qmt_trade.core.config import _deep_merge
 
 router = APIRouter(prefix="/strategy", tags=["strategy"])
 
@@ -21,30 +22,56 @@ def _ctx(mode: str = Query("paper")):
     return ctx.make_ctx_research(mode)
 
 
+def _repository(mode):
+    from qmt_trade.storage.strategies import StrategyRepository
+    return StrategyRepository(_ctx(mode).repos.db)
+
+
 def _instances(mode: str = "paper") -> list[dict]:
-    """实例元数据复用现有账本持久化，避免引入独立配置源。"""
-    raw = _ctx(mode).repos.system.get("strategy_instances", "[]") or "[]"
-    try:
-        value = json.loads(raw)
-        return value if isinstance(value, list) else []
-    except json.JSONDecodeError:
-        return []
+    return _repository(mode).list()
 
 
 def _save_instances(items: list[dict], mode: str) -> None:
-    _ctx(mode).repos.system.set("strategy_instances", json.dumps(items, ensure_ascii=False), "strategy management")
+    try:
+        _repository(mode).save(items)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+def _atomic(fn):
+    import functools
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        import inspect
+        values = inspect.signature(fn).bind_partial(*args, **kwargs).arguments
+        mode = values.get("mode", "paper")
+        with _ctx(mode).repos.db.transaction():
+            return fn(*args, **kwargs)
+    return wrapped
 
 
 @router.get("/management")
 def management(mode: str = Query("paper")):
-    """策略定义只读；运行实例具有独立草稿、发布版本及启停状态。"""
     from qmt_trade.core.config import get_settings
-    from qmt_trade.core.strategy_catalog import build_strategy_catalog
-    catalog = build_strategy_catalog(get_settings())
-    return {"definitions": catalog.get("selection", []) + catalog.get("trading", []), "instances": _instances(mode)}
+    from qmt_trade.core.strategies import list_standalone_strategies, list_strategy_profiles
+    from qmt_trade.core.parameter_schema import defaults, schema
+    settings = get_settings()
+    definitions = [{**item, "params": defaults(item["id"], settings), "schema": schema(item["id"], settings)}
+                   for item in list_standalone_strategies() + list_strategy_profiles()]
+    return {"definitions": definitions, "instances": _instances(mode)}
+
+
+def _validated(sid, params):
+    from qmt_trade.core.parameter_schema import validate
+    from qmt_trade.core.config import get_settings
+    try:
+        return validate(sid, params, get_settings())
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 @router.post("/instances/draft")
+@_atomic
 def save_draft(body: StrategyVersionIn, mode: str = Query("paper")):
     if not body.strategy_id.strip():
         raise HTTPException(422, "strategy_id is required")
@@ -57,12 +84,15 @@ def save_draft(body: StrategyVersionIn, mode: str = Query("paper")):
     elif item["strategy_id"] != body.strategy_id:
         raise HTTPException(422, "strategy_id cannot change for an existing instance")
     item["name"] = body.name.strip() or item["name"]
-    item["draft"] = {"params": body.params, "note": body.note, "updated_at": now}
+    from qmt_trade.core.config import _deep_merge
+    previous = item.get("draft", {}).get("params", {})
+    item["draft"] = {"params": _validated(body.strategy_id, _deep_merge(previous, body.params)), "note": body.note, "updated_at": now}
     _save_instances(items, mode)
     return {"ok": True, "instance": item}
 
 
 @router.post("/instances/publish")
+@_atomic
 def publish_version(body: StrategyVersionIn, mode: str = Query("paper")):
     if not body.instance_id:
         raise HTTPException(422, "instance_id is required; save a draft first")
@@ -70,7 +100,8 @@ def publish_version(body: StrategyVersionIn, mode: str = Query("paper")):
     item = next((x for x in items if x["id"] == body.instance_id), None)
     if item is None or item["strategy_id"] != body.strategy_id:
         raise HTTPException(404, "strategy instance not found")
-    params = body.params or item.get("draft", {}).get("params", {})
+    params = _deep_merge(item.get("draft", {}).get("params", {}), body.params or {})
+    params = _validated(body.strategy_id, params)
     version = {"id": f"v{len(item['versions']) + 1}", "params": params, "note": body.note or item.get("draft", {}).get("note", ""), "published_at": time.time()}
     item["versions"].append(version)
     item["active_version"] = version["id"]
@@ -79,17 +110,22 @@ def publish_version(body: StrategyVersionIn, mode: str = Query("paper")):
 
 
 @router.post("/instances/{instance_id}/rollback/{version_id}")
+@_atomic
 def rollback(instance_id: str, version_id: str, mode: str = Query("paper")):
     items = _instances(mode)
     item = next((x for x in items if x["id"] == instance_id), None)
     if item is None or not any(v["id"] == version_id for v in item.get("versions", [])):
         raise HTTPException(404, "strategy version not found")
-    item["active_version"] = version_id
+    source = next(v for v in item["versions"] if v["id"] == version_id)
+    version = {**source, "id": f"v{len(item['versions']) + 1}", "published_at": time.time(), "note": f"回滚自 {version_id}"}
+    item["versions"].append(version)
+    item["active_version"] = version["id"]
     _save_instances(items, mode)
     return {"ok": True, "instance": item}
 
 
 @router.post("/instances/{instance_id}/enabled")
+@_atomic
 def set_enabled(instance_id: str, body: StrategyInstanceStateIn, mode: str = Query("paper")):
     items = _instances(mode)
     item = next((x for x in items if x["id"] == instance_id), None)
@@ -98,6 +134,17 @@ def set_enabled(instance_id: str, body: StrategyInstanceStateIn, mode: str = Que
     item["enabled"] = body.enabled
     _save_instances(items, mode)
     return {"ok": True, "instance": item}
+
+
+@router.delete("/instances/{instance_id}")
+@_atomic
+def delete_instance(instance_id: str, mode: str = Query("paper")):
+    repository = _repository(mode)
+    item = next((x for x in repository.list() if x["id"] == instance_id), None)
+    if item is None:
+        raise HTTPException(404, "strategy instance not found")
+    repository.delete(instance_id)
+    return {"ok": True}
 
 
 @router.get("/catalog")

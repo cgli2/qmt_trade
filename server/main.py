@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 import server.context as ctx
-from server.routers import (backtest, config, datasource, event, llm, market,
+from server.routers import (backtest, backtests, config, datasource, event, llm, market,
                             memory, notify, overview, report, risk, selection,
                             strategy, strategylab, tail_pick, trade)
 
@@ -120,6 +120,7 @@ def _catchup_research(runner) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    ctx.backtest_service().start()
     sched = None
     try:
         from qmt_trade.scheduler.jobs import JobRunner
@@ -138,6 +139,7 @@ async def lifespan(app: FastAPI):
     yield
     if sched is not None:
         sched.shutdown(wait=False)
+    ctx.backtest_service().shutdown()
 
 
 app = FastAPI(title="QMT Trade WebUI API", version="1.0.0", lifespan=lifespan)
@@ -149,6 +151,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from qmt_trade.storage.runtime import MigrationRequiredError
+
+
+@app.exception_handler(MigrationRequiredError)
+async def migration_required(request, exc):
+    return JSONResponse(status_code=503, content={"detail": str(exc), "code": "MIGRATION_REQUIRED"},
+                        headers={"Retry-After": "30"})
+
 
 @app.exception_handler(ctx.LiveModeLockedError)
 async def _live_locked_handler(request, exc: ctx.LiveModeLockedError):
@@ -158,47 +168,22 @@ async def _live_locked_handler(request, exc: ctx.LiveModeLockedError):
 
 API = "/api"
 
-#: 必须保持 live 锁定的链路（可下单/真实账本/风控闸门）：静默降级会让
-#: 用户误以为在操作 live 账本，故宁可 403 明示。其余所有接口（含未来新增
-#: 路由）由下方中间件统一降级，无需逐路由改造。
-_LIVE_LOCKED_PREFIXES = (f"{API}/trade", f"{API}/risk")
-
-_fallback_logged = False
-
-
 @app.middleware("http")
-async def live_lock_guard(request: Request, call_next):
-    """观察期全局护栏：live 锁死时把非交易链路的 mode=live 入口参数改写为
-    paper，整站只读/研究/运维类页面照常可用；交易/风控白名单保持原样由
-    make_ctx 抛错 → 403。
-
-    注意：BaseHTTPMiddleware 的 call_next 始终用原始 scope 建请求，
-    必须原地改 scope["query_string"]（新构造 Request 传不进去）。"""
-    global _fallback_logged
-    mode = request.query_params.get("mode")
-    if (mode or "").strip().lower() == "live" and ctx.is_live_locked() \
-            and not request.url.path.startswith(_LIVE_LOCKED_PREFIXES):
-        pairs = [(k, "paper" if k == "mode" else v) for k, v in parse_qsl(
-            request.scope.get("query_string", b"").decode(), keep_blank_values=True)]
-        old_qs = request.scope.get("query_string", b"")
-        request.scope["query_string"] = urlencode(pairs).encode()
-        if not _fallback_logged:
-            logger.info("live 处于观察期锁定，非交易链路请求已全局自动降级为 paper"
-                        "（交易/风控链路除外）")
-            _fallback_logged = True
-        logger.debug("live→paper 降级: %s %s", request.method, request.url.path)
-        try:
-            return await call_next(request)
-        finally:
-            request.scope["query_string"] = old_qs      # 还原，避免复用 scope 的副作用
+async def validate_mode(request: Request, call_next):
+    values = request.query_params.getlist("mode")
+    if any(value not in ("paper", "live") for value in values) or len(set(values)) > 1:
+        return JSONResponse(status_code=422, content={"detail": "mode 只能为 paper 或 live"})
     return await call_next(request)
 
 
 def _job_to_dict(j: ctx.Job) -> dict:
+    row = ctx.job_repository().get(j.id)
     return {
         "id": j.id, "kind": j.kind, "status": j.status,
         "progress": j.progress, "created": j.created, "finished": j.finished,
         "result": j.result, "error": j.error,
+        **{k: row[k] for k in ("stage", "heartbeat", "completed", "total", "attempt", "retry_of", "report_id", "error_code")},
+        "state": row["status"],
     }
 
 
@@ -218,13 +203,14 @@ def list_jobs(limit: int = 20):
 
 @app.get(f"{API}/jobs/{{jid}}")
 def get_job(jid: str):
-    j = ctx.get_job(jid)
+    row = ctx.job_repository().get(jid)
+    j = ctx._legacy_job(row, include_result=bool(row and row["kind"] != "backtest"))
     if j is None:
         raise HTTPException(status_code=404, detail="job not found")
     return _job_to_dict(j)
 
 
-for _r in (overview, llm, datasource, config, risk, market, trade,
+for _r in (backtests, overview, llm, datasource, config, risk, market, trade,
            strategy, backtest, event, notify, selection, report, memory,
            tail_pick, strategylab):
     app.include_router(_r.router, prefix=API)
