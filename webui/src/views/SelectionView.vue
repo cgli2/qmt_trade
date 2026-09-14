@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // 选股研判：一页看全「策略 → 漏斗候选池 → 多 Agent 最终精选(3~5只，含理由/投票/辩论)」，
 // 并提供一键选股、策略切换、AI 研判、重点研究清单管理、跳转行情/交易的快捷入口。
-import { onMounted, ref, reactive, watch, computed } from "vue";
+import { onMounted, ref, reactive, watch, computed, inject } from "vue";
 import { useRouter } from "vue-router";
 import api from "@/api";
 import { useApp } from "@/store";
@@ -9,6 +9,10 @@ import { pushToast, tryReq } from "@/toast";
 
 const app = useApp();
 const router = useRouter();
+// 若本页嵌在 MarketHubView 内（/market 路由下的选股研判 tab），inject 到切 tab 函数；
+// 独立 /selection 路由下 inject 兜底为空函数。用于点击个股时先切到「行情与事件」tab，
+// 避免仅 router.push 更新 query 导致 Hub 不重挂载、MarketView 因 v-if 未挂载。
+const hubSetTab = inject<(t: string) => void>("marketHubSetTab", () => {});
 
 // ---------- 最终精选（多 Agent 投票 + 辩论） ----------
 const finals = ref<any[]>([]);
@@ -25,6 +29,26 @@ const picksNote = ref("");
 const pickSearch = ref("");
 const funnel = ref<any[]>([]); // L0 漏斗阶梯
 const funnelNIn = ref(0);
+
+// 全市场标的画像（symbol → name/industry）：候选池 industry 常为“未知”，用真实股票名替代展示。
+// 后端 /market/symbols 已带 TTL 缓存（≈50ms 命中），放在非关键路径后台加载，不阻塞候选池渲染。
+const symbols = ref<any[]>([]);
+const symbolMap = computed(() => {
+  const m: Record<string, any> = {};
+  for (const s of symbols.value) m[s.symbol] = s;
+  return m;
+});
+// 候选池展示名：优先真实名称；名称缺失才回退行业，行业为“未知”则留空（不再暴露占位符）。
+function pickLabel(p: any): string {
+  const nm = String(symbolMap.value[p.symbol]?.name || "").trim();
+  if (nm && nm !== "未知") return nm;
+  const ind = String(p.industry || "").trim();
+  return ind === "未知" ? "" : ind;
+}
+async function loadSymbols() {
+  const r = await tryReq(() => api.symbols(app.mode));
+  symbols.value = r?.symbols || [];
+}
 
 // ---------- 策略预设 ----------
 const strategies = ref<any[]>([]);
@@ -149,7 +173,12 @@ async function runResearch() {
 }
 
 function goMarket(sym: string) {
-  router.push({ path: "/market", query: { sym } });
+  // Hub 内：先切 tab 让 MarketView 挂载（v-if 销毁/重建，挂载后 onMounted reload 读 sym）；
+  // 独立 /selection 路由：hubSetTab 为空函数，仅走 router.push 跳到 /market（Hub 首次挂载默认 market tab）。
+  hubSetTab("market");
+  // 已在 /market 且 query.sym 相同时 push 会 duplicate，catch 掉避免 unhandled rejection；
+  // tab 已切换，MarketView 挂载后自然读取当前 route.query.sym。
+  router.push({ path: "/market", query: { sym } }).catch(() => {});
 }
 
 // ---------------- 重点研究清单 ----------------
@@ -195,11 +224,13 @@ function funnelRemovedPct(stage: any) {
 const poolSize = computed(() => (funnel.value.length ? funnel.value[funnel.value.length - 1]?.after || 0 : 0));
 
 const filteredPicks = ref<any[]>([]);
-watch([picks, pickSearch], () => {
+// 依赖 symbolMap：symbols 异步到位后，按名称的搜索能立即重新过滤
+watch([picks, pickSearch, symbolMap], () => {
   const kw = pickSearch.value.trim().toLowerCase();
   filteredPicks.value = kw
     ? picks.value.filter((p: any) =>
         String(p.symbol).toLowerCase().includes(kw) ||
+        String(symbolMap.value[p.symbol]?.name || "").toLowerCase().includes(kw) ||
         String(p.industry || "").toLowerCase().includes(kw))
     : picks.value;
 }, { immediate: true });
@@ -316,8 +347,8 @@ function fmtEvValue(ev: any) {
   return isFinite(n) ? (Math.abs(n) >= 1 ? n.toFixed(2) : n.toFixed(4)) : String(ev.value);
 }
 
-onMounted(() => { loadStrategies(); loadWatchlist(); loadFinal(); loadPicks(); });
-watch(() => app.mode, () => { loadStrategies(); loadWatchlist(); loadFinal(); loadPicks(); });
+onMounted(() => { loadStrategies(); loadWatchlist(); loadFinal(); loadPicks(); loadSymbols(); });
+watch(() => app.mode, () => { loadStrategies(); loadWatchlist(); loadFinal(); loadPicks(); loadSymbols(); });
 </script>
 
 <template>
@@ -507,18 +538,18 @@ watch(() => app.mode, () => { loadStrategies(); loadWatchlist(); loadFinal(); lo
           <h3>🎯 候选池 Top{{ picks.length }}
             <span class="sub">规则漏斗 + 因子打分</span>
           </h3>
-          <input v-model="pickSearch" class="search" placeholder="过滤代码/行业…" />
+          <input v-model="pickSearch" class="search" placeholder="过滤代码/名称/行业…" />
           <div class="pool-list">
             <button
               v-for="p in filteredPicks"
               :key="p.symbol"
               class="pool-row"
               @click="goMarket(p.symbol)"
-              :title="'查看 ' + p.symbol + ' 行情'"
+              :title="`查看 ${p.symbol}${p.industry && p.industry !== '未知' ? ' · ' + p.industry : ''} 行情`"
             >
               <span class="rk">#{{ p.rank }}</span>
               <span class="sym">{{ p.symbol }}</span>
-              <span class="ind">{{ p.industry || "" }}</span>
+              <span class="ind">{{ pickLabel(p) }}</span>
               <span class="sc">{{ Number(p.score).toFixed(3) }}</span>
             </button>
             <div v-if="!filteredPicks.length" class="muted" style="font-size:13px; padding:8px 4px">

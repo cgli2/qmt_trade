@@ -1,8 +1,23 @@
 <script setup lang="ts">
-import { defineAsyncComponent, ref } from "vue";
+import { defineAsyncComponent, provide, ref, watch } from "vue";
+import { useRoute } from "vue-router";
 const Market = defineAsyncComponent(() => import("./MarketView.vue"));
 const Selection = defineAsyncComponent(() => import("./SelectionView.vue"));
+const route = useRoute();
 const tab = ref("market");
+
+// 供子视图（如 SelectionView）主动切换 Hub 内部 tab：从选股研判点击个股时，若仅 router.push
+// 更新 query，Hub 不会重挂载、tab 仍是 selection，MarketView 因 v-if 未挂载导致 K 线窗口打不开。
+// 子视图 inject 后可先切 tab 再 push，确保 MarketView 立即挂载并响应深链。
+provide("marketHubSetTab", (t: string) => {
+  if (t === "market" || t === "selection") tab.value = t;
+});
+
+// 深链兜底：外部 URL 带 ?sym=（如浏览器直接访问 /market?sym=xxx 或从 /selection 独立路由跳转）
+// 强制切到「行情与事件」tab，让 MarketView 挂载并 loadKline。
+watch(() => route.query.sym, (v) => {
+  if (v) tab.value = "market";
+});
 </script>
 <template>
   <div class="hub-tabs" role="tablist">

@@ -133,8 +133,10 @@ async function openOrder() {
 
 async function submitOrder() {
   const d = orderDlg.value;
-  if (!d?.symbol) return pushToast("请选择标的", "warn");
-  const r = await tryReq(() => api.order({
+  if (!d?.symbol) return pushToast("请选择标的", "err");
+  // 手动下单走 POST /trade/intent：Intent 原样穿过三道风控闸门（仓位/风控/KillSwitch），
+  // 与策略产出的 Intent 同链路；api.orders 是 GET 列表读接口，不能复用。
+  const r = await tryReq(() => api.submitIntent({
     symbol: d.symbol, action: d.action, shares: Number(d.shares) || 0,
     price: d.price != null && d.price !== "" ? Number(d.price) : null,
     confidence: Number(d.confidence) || 0.6, conviction: d.conviction,
@@ -150,17 +152,21 @@ async function runPlan() {
 }
 
 async function settle() {
-  if (typeof api.settle !== 'function') {
-    pushToast('盘后结算功能暂未开放', 'warning');
+  // 后端尚未提供 /trade/settle，api.settle 也不在客户端中；保留 typeof 守卫形态，
+  // 未来在 api.ts 里补上 settle 方法后此处自动生效（否则总是提示“暂未开放”）。
+  const maybe = (api as any).settle;
+  if (typeof maybe !== 'function') {
+    pushToast('盘后结算功能暂未开放', 'info');
     return;
   }
-  const r = await tryReq(() => api.settle(props.mode), "结算完成");
+  const r = await tryReq(() => maybe(props.mode), "结算完成");
   if (r) load();
 }
 
 async function resetLedger() {
   if (!confirm("确认重置模拟账本？将清空所有模拟持仓与订单记录。")) return;
-  const r = await tryReq(() => api.resetPaper(), "模拟账本已重置");
+  // 对应后端 DELETE /trade/positions（仅 paper 允许，live 会直接 403）
+  const r = await tryReq(() => api.positionsReset(props.mode), "模拟账本已重置");
   if (r) load();
 }
 
