@@ -94,12 +94,17 @@ class HealthMonitor:
     ``killswitch`` 传入后，体检出现 blocking 项会自动降级。
     """
 
-    def __init__(self, settings=None, *, repos=None, killswitch=None,
-                 notifier: Notifier | None = None):
+    def __init__(self, settings=None, *, repos=None, shared_repos=None,
+                 killswitch=None, notifier: Notifier | None = None):
         cfg = (settings.section("ops").get("monitor", {}) if settings is not None else {})
         cfg = cfg if isinstance(cfg, dict) else {}
         self.settings = settings
         self.repos = repos
+        # 系统级状态（job 心跳、数据同步水位）跨 mode 共享：常驻调度器可能跑在
+        # 另一 mode 的进程里（如 paper），而体检在 live 侧——两者必须读到同一份，
+        # 否则调度器写的心跳 live 永远看不见，job 被误判“失联”→ KillSwitch 误拉闸。
+        # 未显式注入时退回 repos，保持测试/回测等单库场景的原行为。
+        self.shared_repos = shared_repos if shared_repos is not None else repos
         self.killswitch = killswitch
         self.notifier = notifier
         self.heartbeat_seconds = float(cfg.get("heartbeat_seconds", 120))
@@ -121,9 +126,17 @@ class HealthMonitor:
         self._beats[component] = now
         # 持久化到库：CLI/脚本等一次性进程做健康检查时，
         # 也能看到常驻调度进程最近是否真的在跑。
-        if self.repos is not None:
+        # job:* 是一次性调度任务的心跳，与 mode 无关 → 写跨 mode 共享库，
+        # 使 paper 调度器上报的存活，live 侧体检也能读到（反之亦然）。
+        # 其余（watchdog/常驻组件）是“当前活跃 mode 进程内”的信号，仍写本 mode。
+        repo = None
+        if component.startswith("job:") and self.shared_repos is not None:
+            repo = self.shared_repos.system
+        elif self.repos is not None:
+            repo = self.repos.system
+        if repo is not None:
             try:
-                self.repos.system.set(f"hb:{component}", f"{now:.0f}")
+                repo.set(f"hb:{component}", f"{now:.0f}")
             except Exception:                       # noqa: BLE001
                 pass
 
@@ -158,8 +171,19 @@ class HealthMonitor:
 
     def _read_db_beats(self) -> dict[str, float]:
         out: dict[str, float] = {}
-        rows = self.repos.system.list_prefix("hb:")
-        for key, raw in rows.items():
+        # job:* 心跳从跨 mode 共享库回读：调度器跑在哪个 mode 都能被看见。
+        job_sys = (self.shared_repos.system if self.shared_repos is not None
+                   else self.repos.system)
+        for key, raw in job_sys.list_prefix("hb:job:").items():
+            try:
+                out[key[3:]] = float(raw)
+            except (TypeError, ValueError):
+                continue
+        # 其余心跳（watchdog/常驻组件）从本 mode 库回读；跳过本 mode 里可能残留的
+        # 旧 job:* 值（迁移前写入），以免覆盖共享库里的新鲜值。
+        for key, raw in self.repos.system.list_prefix("hb:").items():
+            if key.startswith("hb:job:"):
+                continue
             try:
                 out[key[3:]] = float(raw)
             except (TypeError, ValueError):
@@ -167,7 +191,36 @@ class HealthMonitor:
         return out
 
     def _check_data_freshness(self, asof: date | None = None) -> CheckResult:
-        """数据是否停更。停更后所有因子都是隔夜馊饭，必须停开仓。"""
+        """数据是否停更。停更后所有因子都是隔夜馊饭，必须停开仓。
+
+        新鲜度是“系统级”事实，与账本 mode 无关：优先读 data_sync 写入跨 mode
+        共享库的行情同步水位（``data:freshness``）；老库/首次尚无该标记时，
+        退回本 mode 的组合快照日期，保持向后兼容。
+        """
+        today = asof or date.today()
+        src = self.shared_repos if self.shared_repos is not None else self.repos
+        if src is not None:
+            try:
+                raw = src.system.get("data:freshness")
+            except Exception:                       # noqa: BLE001
+                raw = None
+            if raw:
+                try:
+                    last = datetime.strptime(str(raw)[:10], "%Y-%m-%d").date()
+                except Exception:                   # noqa: BLE001
+                    last = None
+                if last is not None:
+                    lag = (today - last).days
+                    if lag > self.max_data_lag_days:
+                        return CheckResult(
+                            "data_freshness", False, Level.ERROR,
+                            f"数据落后 {lag} 天（上限 {self.max_data_lag_days}）",
+                            {"last": last.isoformat(), "lag_days": lag, "src": "data_sync"})
+                    return CheckResult(
+                        "data_freshness", True, Level.INFO,
+                        f"最新 {last}（落后 {lag} 天）",
+                        {"lag_days": lag, "src": "data_sync"})
+        # ---- fallback：本 mode 组合快照（迁移前旧库 / data_sync 尚未写过水位）----
         if self.repos is None:
             return CheckResult("data_freshness", True, Level.INFO, "未接数据库，跳过")
         try:
@@ -182,7 +235,7 @@ class HealthMonitor:
         except Exception:
             return CheckResult("data_freshness", False, Level.WARN,
                                f"快照日期不可解析: {row.get('trade_date')}")
-        lag = ((asof or date.today()) - last).days
+        lag = (today - last).days
         if lag > self.max_data_lag_days:
             return CheckResult("data_freshness", False, Level.ERROR,
                                f"数据落后 {lag} 天（上限 {self.max_data_lag_days}）",

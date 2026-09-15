@@ -460,7 +460,10 @@ def cmd_reconcile(args) -> int:
         if not hasattr(broker, "query_positions"):
             logger.error(f"{ctx.mode} 模式没有券商可对账，请用 --mode live")
             return EXIT_USAGE
-        res = ctx.reconciler.run(day, broker)
+        # 统一走 reconcile_now（先 persist_portfolio 刷库，再比券商）——调度作业、
+        # HTTP 端点、CLI 在线/离线四条路必须共用同一入口。直接调 reconciler.run
+        # 会拿一个还没落库的账本去比券商：实盘空账本恒报 POSITION_MISSING。
+        res = ctx.reconcile_now(day)
         logger.info(res.render())
         return EXIT_OK if res.passed else EXIT_FAIL
 

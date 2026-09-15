@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import {
+  MODE,
+} from "@/labels";
 import { computed } from "vue";
 import { useRoute } from "vue-router";
 import { useApp } from "@/store";
@@ -26,10 +29,7 @@ const title = computed(() => route.meta.title || "控制台");
 // 交易页把"模式"收敛到内部响应式切换（不重建组件），其余页面保持原有"切模式即刷新"的行为
 const viewKey = computed(() => (route.path.startsWith("/trade") ? "trade" : app.mode));
 const modes = ["paper", "live"];
-const modeLabels: Record<string, string> = {
-  paper: "模拟盘",
-  live: "实盘",
-};
+const modeLabels = MODE;
 
 function toggleTheme() {
   app.setTheme(app.theme === "dark" ? "light" : "dark");

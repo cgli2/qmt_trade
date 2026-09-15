@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import {
+  JOB_KIND, JOB_STATUS, POOL_STATUS, cn, cnTitle,
+} from "@/labels";
 import { computed, onMounted, ref, watch } from "vue";
 import api from "@/api";
 import { useApp } from "@/store";
@@ -189,7 +192,7 @@ watch(() => app.mode, () => { load(); loadManagement(); });
         <tbody>
           <tr v-for="r in rows" :key="r.name">
             <td><b>{{ r.name }}</b></td>
-            <td><span class="badge" :class="poolBadge(r.status)">{{ r.status }}</span></td>
+            <td><span class="badge" :class="poolBadge(r.status)" :title="cnTitle(POOL_STATUS, r.status)">{{ cn(POOL_STATUS, r.status) }}</span></td>
             <td>
               <div class="pill">{{ (Number(r.weight) * 100).toFixed(1) }}%</div>
               <div style="height:4px;background:var(--bg-2);border-radius:2px;margin-top:3px">
@@ -244,8 +247,8 @@ watch(() => app.mode, () => { load(); loadManagement(); });
         <tbody>
           <tr v-for="j in jobs" :key="j.id">
             <td class="pill tiny">{{ j.id }}</td>
-            <td>{{ j.kind }}</td>
-            <td><span class="badge" :class="statusBadge(j.status)">{{ j.status }}</span></td>
+            <td :title="cnTitle(JOB_KIND, j.kind)">{{ cn(JOB_KIND, j.kind) }}</td>
+            <td><span class="badge" :class="statusBadge(j.status)" :title="cnTitle(JOB_STATUS, j.status)">{{ cn(JOB_STATUS, j.status) }}</span></td>
             <td class="tiny muted">{{ ts(j.created) }}</td>
             <td class="tiny muted">{{ ts(j.finished) }}</td>
             <td><button class="btn sm ghost" :disabled="j.status === 'running' || j.status === 'pending'" @click="showJob(j)">查看</button></td>

@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import {
+  MODE, ORDER_STATUS, SIDE, cn, cnTitle,
+} from "@/labels";
 // 尾盘选股法（一夜持股法）独立控制面板。
 // 完全独立于现有多因子选股/Regime/风控体系：只读/写 strategies.tail_pick
 // 配置段与 tail_pick_* 两个调度任务，手动触发复用通用 /scheduler/run。
@@ -309,7 +312,7 @@ watch(() => app.mode, load);
           </button>
         </div>
         <div class="tp-item">
-          <span class="tp-label">历史表现（{{ app.mode }}）</span>
+          <span class="tp-label">历史表现（{{ cn(MODE, app.mode) }}）</span>
           <span class="tiny">胜率 {{ pct(st?.perf?.win_rate) }}（{{ st?.perf?.wins || 0 }}/{{ st?.perf?.n_roundtrips || 0 }}）</span>
           <span class="tiny">累计盈亏 {{ money(st?.perf?.total_pnl) }}</span>
         </div>
@@ -415,9 +418,9 @@ watch(() => app.mode, load);
             <tr v-for="o in (st?.orders || []).slice(0, 20)" :key="o.id">
               <td class="tiny">{{ o.trade_date }}</td>
               <td><b>{{ o.symbol }}</b></td>
-              <td><span class="badge sm" :class="o.side === 'BUY' ? 'ok' : 'warn'">{{ o.side }}</span></td>
+              <td><span class="badge sm" :class="o.side === 'BUY' ? 'ok' : 'warn'" :title="cnTitle(SIDE, o.side)">{{ cn(SIDE, o.side) }}</span></td>
               <td class="tiny">{{ o.avg_fill_price ? Number(o.avg_fill_price).toFixed(2) : "-" }} × {{ o.filled_volume }}/{{ o.volume }}</td>
-              <td class="tiny muted">{{ o.status }}</td>
+              <td class="tiny muted" :title="cnTitle(ORDER_STATUS, o.status)">{{ cn(ORDER_STATUS, o.status) }}</td>
             </tr>
             <tr v-if="!st?.orders?.length"><td colspan="5" class="muted">暂无尾盘策略订单</td></tr>
           </tbody>

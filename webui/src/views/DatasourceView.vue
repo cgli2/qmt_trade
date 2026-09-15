@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import {
+  CAPABILITY, CIRCUIT_STATE, RUN_STATUS, cn, cnTitle,
+} from "@/labels";
 import { onMounted, ref, watch } from "vue";
 import api from "@/api";
 import { useApp } from "@/store";
@@ -29,6 +32,14 @@ async function save() {
   if (r) load();
 }
 
+// 健康状态：state 是熔断态（closed/open/half_open），缺失时退回 healthy 布尔
+function hbText(h: any) {
+  return h?.state ? cn(CIRCUIT_STATE, h.state) : cn(RUN_STATUS, h?.healthy === false ? "FAIL" : "OK");
+}
+function hbTitle(h: any) {
+  return h?.state ? cnTitle(CIRCUIT_STATE, h.state) : cnTitle(RUN_STATUS, h?.healthy === false ? "FAIL" : "OK");
+}
+
 function hb(h: any) {
   if (h.healthy === false || h.state === "open") return "danger";
   if (h.state === "half_open") return "warn";
@@ -51,7 +62,7 @@ watch(() => app.mode, load);
         <thead><tr><th style="width:180px">数据类型</th><th>优先级顺序（逗号分隔，从左到右依次尝试）</th></tr></thead>
         <tbody>
           <tr v-for="(_v, k) in editing" :key="k">
-            <td><b>{{ k }}</b></td>
+            <td><b :title="cnTitle(CAPABILITY, k)">{{ cn(CAPABILITY, k) }}</b></td>
             <td><input v-model="editing[k]" placeholder="qmt, akshare, tushare, mock" /></td>
           </tr>
           <tr v-if="!Object.keys(editing).length"><td colspan="2" class="muted">未配置 datahub.priority</td></tr>
@@ -88,7 +99,7 @@ watch(() => app.mode, load);
           <tbody>
             <tr v-for="(h, i) in data?.health || []" :key="i">
               <td><b>{{ h.name || h.source || "-" }}</b></td>
-              <td><span class="badge" :class="hb(h)">{{ h.state || (h.healthy === false ? "FAIL" : "OK") }}</span></td>
+              <td><span class="badge" :class="hb(h)" :title="hbTitle(h)">{{ hbText(h) }}</span></td>
               <td class="tiny muted">
                 {{ h.error || h.last_error || "" }}
                 <template v-if="h.failures !== undefined">失败 {{ h.failures }} 次</template>

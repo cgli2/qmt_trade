@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time as dtime, timedelta
 from typing import Any, Callable
 
-from .jobs import JobResult, JobRunner
+from .jobs import CRITICAL_JOBS, JobResult, JobRunner
 
 logger = logging.getLogger(__name__)
 
@@ -275,24 +275,39 @@ class TradingScheduler:
                           max_instances=1, replace_existing=True)
         # 机器休眠/卡顿时 cron 触发点超过宽限期，APScheduler 会直接丢弃该次执行——
         # 任务没跑就不会打心跳，超过 24h 后被体检误判「组件失联」降级 REDUCE_ONLY。
-        # 错过 ≠ 失联：调度器还活着，补一条心跳防止健康检查误报。
+        # 分两种处理：关键任务（data_sync/reconcile/intraday）错过 = 真实缺口，只补
+        # 心跳会掩盖问题（数据没预热却显示"活着"），故直接补跑本体；其余任务补心跳
+        # 防误报即可（详见 _on_job_missed）。
         try:
             from apscheduler.events import EVENT_JOB_MISSED
             sched.add_listener(self._on_job_missed, EVENT_JOB_MISSED)
         except Exception:                            # noqa: BLE001
-            logger.warning("注册 EVENT_JOB_MISSED 监听失败，错过补心跳失效")
+            logger.warning("注册 EVENT_JOB_MISSED 监听失败，错过补救失效")
         return sched
 
     def _on_job_missed(self, event) -> None:
-        """APScheduler EVENT_JOB_MISSED 回调：任务被错过（多为机器休眠），补打心跳。"""
+        """APScheduler EVENT_JOB_MISSED 回调：任务被错过（多为机器休眠/卡顿）。
+
+        - **关键任务**（CRITICAL_JOBS：data_sync/reconcile/intraday）：错过是真实
+          数据/对账缺口，只补心跳会掩盖问题——体检看着"活着"，实则当日行情根本没
+          预热。故直接补跑本体：``_fire`` 内部走 ``run_job`` → ``@job`` 包装器，会
+          自动打心跳、留痕、并在失败时按 CRITICAL 拉闸，与正常触发完全一致。任务
+          本体自带守卫（非交易日跳过、空样本判失败），补跑安全。
+        - **非关键任务**（research/plan/evolve 等）：错过多为时序性问题，在错误时点
+          补跑可能触发副作用（如盘中跑盘前任务），维持原「只补心跳防体检误判失联」。
+        """
         try:
             name = str(getattr(event, "job_id", "") or "")
             if not name:
                 return
-            self.runner._beat(name)                  # noqa: SLF001 - 同包内可控
-            logger.warning("调度任务 %s 被错过（机器休眠/卡顿？），已补心跳防体检误判失联", name)
+            if name in CRITICAL_JOBS:
+                logger.warning("关键任务 %s 被错过（机器休眠/卡顿？），补跑本体", name)
+                self._guarded_fire(name)
+            else:
+                self.runner._beat(name)              # noqa: SLF001 - 同包内可控
+                logger.warning("调度任务 %s 被错过，已补心跳防体检误判失联", name)
         except Exception:                            # noqa: BLE001
-            logger.exception("错过补心跳失败")
+            logger.exception("错过补救失败")
 
     def _beat_all(self) -> None:
         """进程启动即所有调度组件存活：补一轮心跳，清掉上一进程遗留的过期时间戳。"""

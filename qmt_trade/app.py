@@ -89,6 +89,11 @@ class TradingContext:
 
         self._db_path = db_path
         self._repos = repos
+        # 构造时是否"外部注入"了 repos。repos 属性会惰性把 _repos 从 None 置为
+        # 新建对象，因此 shared_repos 的守卫绝不能用 `_repos is not None` 判断注入，
+        # 否则 monitor 属性里 repos=self.repos 先求值把 _repos 惰性建好后，
+        # shared_repos 会误判"已注入"而塌缩回本 mode 库（live 读不到 paper 心跳）。
+        self._repos_injected = repos is not None
         self._hub = hub
         self._gateway = gateway
         self._notifier = notifier
@@ -151,7 +156,7 @@ class TradingContext:
         """
         if self._shared_repos is not None:
             return self._shared_repos
-        if self._repos is not None or self._db_path is not None or not self.is_live:
+        if self._repos_injected or self._db_path is not None or not self.is_live:
             # 外部注入 repos / 指定了 db_path（测试、回测）：不另开共享库
             self._shared_repos = self.repos
             return self._shared_repos
@@ -282,12 +287,10 @@ class TradingContext:
 
     @property
     def portfolio(self):
-        """组合状态。实盘从数据库还原，回测/模拟用初始现金起步。"""
+        """组合状态。实盘从数据库还原；库为空时以券商真值建基线。
+        只有回测/模拟才用初始现金起步。"""
         if self._portfolio is None:
             from .portfolio.state import PortfolioState
-            cash = self._initial_cash
-            if cash is None:
-                cash = float(self.settings.get("backtest.initial_cash", 1_000_000) or 0)
             snap = None
             try:
                 snap = self.repos.snapshots.latest()
@@ -297,13 +300,84 @@ class TradingContext:
                     self.killswitch.engage(f"账户快照读取失败:{type(exc).__name__}")
             if snap:
                 cash = float(snap["cash"])
-            ps = PortfolioState(cash=cash)
-            if snap:
+                ps = PortfolioState(cash=cash)
                 ps.initial_asset = float(snap["total_asset"]) or cash
                 ps.peak_asset = ps.initial_asset
-            self._restore_positions(ps)
+                self._restore_positions(ps)
+            elif self.is_live:
+                # 实盘空账本：券商是唯一真值来源，绝不用 backtest.initial_cash
+                ps = self._adopt_broker_baseline()
+            else:
+                cash = self._initial_cash
+                if cash is None:
+                    cash = float(self.settings.get("backtest.initial_cash", 1_000_000) or 0)
+                ps = PortfolioState(cash=cash)
+                self._restore_positions(ps)
             self._portfolio = ps
         return self._portfolio
+
+    def _adopt_broker_baseline(self):
+        """实盘账本为空时，按券商真实资产/持仓建立基线并落库。
+
+        这里绝不能回落 ``backtest.initial_cash``：回测本金串味到实盘会让
+        Gate-3 拿虚构现金当「本地真值」去对账 —— 2026-09-15 实盘报
+        ``CASH_MISMATCH 本地=1000000.0 券商=53608.39`` 就是这么来的
+        （8-11 UI 误触 live → review job 把回测本金结转落库 → 迁移带走）。
+        券商查不到就拉闸并抛错：宁可不交易，也不用假账本下单。
+        """
+        from .portfolio.state import PortfolioState
+        broker = self.gateway
+        try:
+            asset = broker.query_asset() or {}
+            rows = broker.query_positions() or []
+        except Exception as exc:
+            logger.error("实盘基线采纳失败：券商查询异常 %s", exc)
+            self.killswitch.engage(f"实盘基线采纳失败:{type(exc).__name__}")
+            raise ContextError(f"实盘基线采纳失败：{exc}") from exc
+
+        raw_cash = asset.get("cash", asset.get("m_dCash"))
+        if raw_cash is None:
+            logger.error("实盘基线采纳失败：券商未返回现金字段 keys=%s", list(asset))
+            self.killswitch.engage("实盘基线采纳失败:券商无现金字段")
+            raise ContextError("实盘基线采纳失败：券商未返回现金字段")
+
+        ps = PortfolioState(cash=float(raw_cash))
+        today = date.today()
+        for r in rows:
+            sym = str(r.get("symbol") or r.get("stock_code") or "")
+            vol = int(r.get("volume") or r.get("m_nVolume") or 0)
+            if not sym or vol <= 0:
+                continue
+            avg_cost = float(r.get("avg_cost") or r.get("open_price") or 0.0)
+            # QMTGateway 只给 market_value 不给现价。必须按市值反推：
+            # position_value 的口径是 shares*(last_price or avg_cost)，若留空
+            # 就会按成本价估值 —— 浮亏仓位被算成没亏，total_asset 虚高，
+            # peak_asset 跟着虚高，之后每天的真实回撤都被放大甚至误触拉闸。
+            mv = float(r.get("market_value") or 0.0)
+            last = float(r.get("last_price") or 0.0) or (mv / vol if mv > 0 else avg_cost)
+            ps.positions[sym] = Position(
+                symbol=sym,
+                shares=vol,
+                avg_cost=avg_cost,
+                can_use=int(r.get("can_use") or r.get("can_use_volume") or 0),
+                # 建仓日未知，按今天起算，让持仓天数守护偏保守而非偏松
+                opened_at=today,
+                highest_since_open=max(last, avg_cost),
+                last_price=last,
+                origin_shares=vol,
+            )
+        raw_total = asset.get("total_asset", asset.get("m_dBalance"))
+        ps.initial_asset = float(raw_total) if raw_total else ps.total_asset
+        ps.peak_asset = ps.initial_asset
+
+        # 先挂上再落库：persist_portfolio 内部会回读 self.portfolio
+        self._portfolio = ps
+        if not self.persist_portfolio(today):
+            self.killswitch.engage("实盘基线落库失败")
+            raise ContextError("实盘基线采纳失败：写库未成功")
+        logger.warning("实盘账本为空，已按券商真值建立基线：cash=%.2f 持仓=%s",
+                       ps.cash, sorted(ps.positions))
+        return ps
 
     def _restore_positions(self, ps) -> None:
         """从 positions 表还原持仓。读失败在实盘下必须拉闸——
@@ -410,6 +484,18 @@ class TradingContext:
                                           notifier=self.notifier)
         return self._reconciler
 
+    def reconcile_now(self, day: date | None = None):
+        """Gate-3 对账的唯一入口：先把内存账本刷进库，再与券商比。
+
+        顺序不能反 —— ``Reconciler`` 读的是库（repos），不是内存 ``portfolio``。
+        少了刷库这步，就是拿一个还没落库的账本去比券商：实盘账本为空时恒报
+        POSITION_MISSING，页面上点「对账」永远过不了（2026-09-15 现场）。
+        调度作业与 HTTP 端点必须共用本方法，否则两条路迟早再次走偏。
+        """
+        d = day or date.today()
+        self.persist_portfolio(d)
+        return self.reconciler.run(d, self.gateway)
+
     @property
     def reporter(self):
         if self._reporter is None:
@@ -423,6 +509,7 @@ class TradingContext:
         if self._monitor is None:
             from .ops.monitor import HealthMonitor
             self._monitor = HealthMonitor(self.settings, repos=self.repos,
+                                          shared_repos=self.shared_repos,
                                           killswitch=self.killswitch,
                                           notifier=self.notifier)
             self._monitor.register("datahub", self._check_hub)

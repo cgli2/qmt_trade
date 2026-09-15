@@ -6,6 +6,9 @@ import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import api from "@/api";
 import { useApp } from "@/store";
 import { pushToast, tryReq } from "@/toast";
+import {
+  cn, cnTitle, CONVICTION, KILL_MODE, ORDER_STATUS, REJECTED_BY, SIDE, TRADE_ACTION,
+} from "@/labels";
 import Modal from "@/components/Modal.vue";
 import SymbolSelect from "@/components/SymbolSelect.vue";
 import SymbolDetailModal from "@/components/SymbolDetailModal.vue";
@@ -257,10 +260,10 @@ watch(() => props.mode, () => { recon.value = null; symbolDlg.value = null; load
                 <tr v-for="(o, i) in orders" :key="i">
                   <td><a class="sym-link" @click="openSymbol(o.symbol)">{{ o.symbol }}</a></td>
                   <td class="tiny">{{ o.name || "-" }}</td>
-                  <td><span class="badge" :class="String(o.side).includes('BUY') ? 'danger' : 'ok'">{{ o.side }}</span></td>
+                  <td><span class="badge" :class="String(o.side).includes('BUY') ? 'danger' : 'ok'" :title="cnTitle(SIDE, o.side)">{{ cn(SIDE, o.side) }}</span></td>
                   <td class="pill">{{ o.shares ?? o.volume }}</td>
                   <td class="pill">{{ o.price != null ? Number(o.price).toFixed(3) : "-" }}</td>
-                  <td><span class="badge muted">{{ o.status }}</span></td>
+                  <td><span class="badge muted" :title="cnTitle(ORDER_STATUS, o.status)">{{ cn(ORDER_STATUS, o.status) }}</span></td>
                   <td class="tiny muted">{{ fmtTs(o.created_at || o.trade_date) }}</td>
                 </tr>
                 <tr v-if="!orders.length"><td colspan="7" class="muted">无订单</td></tr>
@@ -277,9 +280,9 @@ watch(() => props.mode, () => { recon.value = null; symbolDlg.value = null; load
               <tbody>
                 <tr v-for="(t, i) in intents" :key="i">
                   <td><a class="sym-link" @click="openSymbol(t.symbol)">{{ t.symbol }}</a></td>
-                  <td><span class="badge" :class="t.action === 'BUY' ? 'danger' : (t.action === 'SELL' ? 'ok' : 'muted')">{{ t.action }}</span></td>
+                  <td><span class="badge" :class="t.action === 'BUY' ? 'danger' : (t.action === 'SELL' ? 'ok' : 'muted')" :title="cnTitle(TRADE_ACTION, t.action)">{{ cn(TRADE_ACTION, t.action) }}</span></td>
                   <td class="pill">{{ t.confidence != null ? Number(t.confidence).toFixed(2) : "-" }}</td>
-                  <td class="tiny">{{ t.conviction }}</td>
+                  <td class="tiny" :title="cnTitle(CONVICTION, t.conviction)">{{ cn(CONVICTION, t.conviction) }}</td>
                   <td class="tiny muted" style="max-width:280px">{{ (t.reasoning || "").slice(0, 90) }}</td>
                 </tr>
                 <tr v-if="!intents.length"><td colspan="5" class="muted">无意图记录</td></tr>
@@ -307,8 +310,8 @@ watch(() => props.mode, () => { recon.value = null; symbolDlg.value = null; load
 
       <div class="card">
         <h3>💰 实盘账户 <span class="sub">数据直连券商（QMT）</span>
-          <span v-if="broker?.killswitch" class="badge" :class="killBadge(broker.killswitch)" style="margin-left:8px">
-            KillSwitch: {{ broker.killswitch }}
+          <span v-if="broker?.killswitch" class="badge" :class="killBadge(broker.killswitch)" :title="cnTitle(KILL_MODE, broker.killswitch)" style="margin-left:8px">
+            KillSwitch: {{ cn(KILL_MODE, broker.killswitch) }}
           </span>
         </h3>
 
@@ -351,10 +354,10 @@ watch(() => props.mode, () => { recon.value = null; symbolDlg.value = null; load
               <tr v-for="(o, i) in orders" :key="i">
                 <td><a class="sym-link" @click="openSymbol(o.symbol)">{{ o.symbol }}</a></td>
                 <td class="tiny">{{ o.name || "-" }}</td>
-                <td><span class="badge" :class="String(o.side).includes('BUY') ? 'danger' : 'ok'">{{ o.side }}</span></td>
+                <td><span class="badge" :class="String(o.side).includes('BUY') ? 'danger' : 'ok'" :title="cnTitle(SIDE, o.side)">{{ cn(SIDE, o.side) }}</span></td>
                 <td class="pill">{{ o.shares ?? o.volume }}</td>
                 <td class="pill">{{ o.price != null ? Number(o.price).toFixed(3) : "-" }}</td>
-                <td><span class="badge muted">{{ o.status }}</span></td>
+                <td><span class="badge muted" :title="cnTitle(ORDER_STATUS, o.status)">{{ cn(ORDER_STATUS, o.status) }}</span></td>
                 <td class="tiny muted">{{ fmtTs(o.created_at || o.trade_date) }}</td>
               </tr>
               <tr v-if="!orders.length"><td colspan="7" class="muted">无订单</td></tr>
@@ -389,7 +392,7 @@ watch(() => props.mode, () => { recon.value = null; symbolDlg.value = null; load
           <SymbolSelect v-model="orderDlg.symbol" :options="symbols" :placeholder="symbolsLoading ? '标的列表加载中…' : '搜索 5500+ 标的'" />
         </div>
         <div class="field"><label>动作</label>
-          <select v-model="orderDlg.action"><option>BUY</option><option>SELL</option></select>
+          <select v-model="orderDlg.action"><option value="BUY">买入</option><option value="SELL">卖出</option></select>
         </div>
       </div>
       <div class="row">
@@ -399,7 +402,7 @@ watch(() => props.mode, () => { recon.value = null; symbolDlg.value = null; load
       <div class="row">
         <div class="field"><label>置信度 0~1</label><input v-model="orderDlg.confidence" type="number" step="0.05" min="0" max="1" /></div>
         <div class="field"><label>信念强度</label>
-          <select v-model="orderDlg.conviction"><option>LOW</option><option>MEDIUM</option><option>HIGH</option></select>
+          <select v-model="orderDlg.conviction"><option value="LOW">低确信</option><option value="MEDIUM">中确信</option><option value="HIGH">高确信</option></select>
         </div>
         <div class="field"><label>止损方式</label>
           <select v-model="orderDlg.stop_loss_type">
@@ -414,8 +417,8 @@ watch(() => props.mode, () => { recon.value = null; symbolDlg.value = null; load
       <div v-if="orderResult" style="margin-top:10px">
         <span class="badge" :class="orderResult.ok ? 'ok' : 'danger'">{{ orderResult.ok ? "已成交" : "被拦截" }}</span>
         <span class="tiny muted" style="margin-left:8px">
-          {{ orderResult.symbol }} {{ orderResult.action }} {{ orderResult.shares }} 股
-          <template v-if="orderResult.rejected_by"> · 拦截层 {{ orderResult.rejected_by }}</template>
+          {{ orderResult.symbol }} {{ cn(TRADE_ACTION, orderResult.action) }} {{ orderResult.shares }} 股
+          <template v-if="orderResult.rejected_by"> · 拦截层 <span :title="cnTitle(REJECTED_BY, orderResult.rejected_by)">{{ cn(REJECTED_BY, orderResult.rejected_by) }}</span></template>
         </span>
         <pre class="json" style="margin-top:8px">{{ JSON.stringify(orderResult, null, 2) }}</pre>
       </div>

@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import {
+  EVENT_CATEGORY, cn, cnTitle,
+} from "@/labels";
 import { computed, onMounted, ref, watch } from "vue";
 import api from "@/api";
 import { useApp } from "@/store";
@@ -105,7 +108,7 @@ watch(() => app.mode, load);
             <tr v-for="e in events" :key="e.id">
               <td class="tiny pill">{{ String(e.ann_time).replace("T", " ").slice(0, 16) }}</td>
               <td class="tiny">{{ e.symbol }}</td>
-              <td><span class="badge muted">{{ e.category }}</span></td>
+              <td><span class="badge muted" :title="cnTitle(EVENT_CATEGORY, e.category)">{{ cn(EVENT_CATEGORY, e.category) }}</span></td>
               <td>{{ e.title }}<div class="tiny muted" v-if="e.detail">{{ String(e.detail).slice(0, 80) }}</div></td>
               <td class="pill tiny">{{ e.importance ?? "-" }}</td>
               <td><span class="badge" :class="sentBadge(e.sentiment)" :title="sentTitle(e.sentiment)">{{ sentLabel(e.sentiment) }}</span></td>
@@ -145,7 +148,7 @@ watch(() => app.mode, load);
           <tr v-for="h in hard" :key="h.id">
             <td class="tiny pill">{{ String(h.ann_time).replace("T", " ").slice(0, 16) }}</td>
             <td class="tiny"><b>{{ h.symbol }}</b></td>
-            <td><span class="badge danger">{{ h.category }}</span></td>
+            <td><span class="badge danger" :title="cnTitle(EVENT_CATEGORY, h.category)">{{ cn(EVENT_CATEGORY, h.category) }}</span></td>
             <td>{{ h.title }}</td>
             <td><span class="badge" :class="sentBadge(h.sentiment)" :title="sentTitle(h.sentiment)">{{ sentLabel(h.sentiment) }}</span></td>
           </tr>

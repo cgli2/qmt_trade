@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import {
+  CHANNEL, LEVEL, cn, cnTitle,
+} from "@/labels";
 import { onMounted, ref } from "vue";
 import api from "@/api";
 import { useApp } from "@/store";
@@ -128,7 +131,7 @@ onMounted(load);
                 {{ ch.secret_set ? "已配置" : "缺失" }}
               </span>
             </td>
-            <td class="tiny">{{ ch.min_level || "INFO" }}</td>
+            <td class="tiny" :title="cnTitle(LEVEL, ch.min_level || 'INFO')">{{ cn(LEVEL, ch.min_level || "INFO") }}</td>
             <td><span class="badge" :class="ch.enabled === false ? 'muted' : 'ok'">{{ ch.enabled === false ? "停用" : "启用" }}</span></td>
             <td>
               <button class="btn sm ghost" @click="editChannel(ch, i)">编辑</button>
@@ -172,7 +175,7 @@ onMounted(load);
         </div>
         <div class="field"><label>最低推送级别</label>
           <select v-model="chDlg.min_level">
-            <option>INFO</option><option>WARN</option><option>ERROR</option><option>CRITICAL</option>
+            <option value="INFO">提示</option><option value="WARN">警告</option><option value="ERROR">严重</option><option value="CRITICAL">致命</option>
           </select>
         </div>
       </div>
@@ -195,7 +198,7 @@ onMounted(load);
       <div class="field"><label>指定频道（留空=全部已启用）</label>
         <select v-model="testDlg.channel">
           <option value="">（全部）</option>
-          <option v-for="(ch, i) in channels" :key="i" :value="ch.type">{{ ch.type }}</option>
+          <option v-for="(ch, i) in channels" :key="i" :value="ch.type">{{ cn(CHANNEL, ch.type) }}</option>
         </select>
       </div>
       <div v-if="testDlg.result" style="margin-top:8px">
@@ -205,7 +208,7 @@ onMounted(load);
         <span class="tiny muted" style="margin-left:8px">{{ testDlg.result.error || "" }}</span>
         <div v-for="r in testDlg.result.channels || []" :key="r.channel" class="tiny" style="margin-top:4px">
           <span class="badge" :class="r.ok ? 'ok' : 'danger'">{{ r.ok ? "成功" : "失败" }}</span>
-          <b style="margin-left:6px">{{ r.channel }}</b>
+          <b style="margin-left:6px" :title="cnTitle(CHANNEL, r.channel)">{{ cn(CHANNEL, r.channel) }}</b>
           <span v-if="!r.ok" class="muted" style="margin-left:6px">{{ r.error }}</span>
         </div>
       </div>

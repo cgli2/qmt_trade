@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import {
+  FREQ, JOB_STATUS, SIDE, cn, cnTitle,
+} from "@/labels";
 import { computed, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import api from "@/api";
@@ -16,7 +19,6 @@ const current = computed(() => history.value.find(j => j.id === selected.value))
 const versions = computed(() => instances.value.filter(i => i.strategy_id === form.value.strategy && i.active_version));
 let reportGeneration = 0;
 let submitKey = "", submitBody = "";
-const statusLabels: Record<string,string> = {pending:"排队中", running:"运行中", done:"已完成", error:"失败或中断",queued:"排队中",succeeded:"已完成",failed:"失败",cancelled:"已取消",interrupted:"已中断"};
 const labels: Record<string,string> = {total_return:"总收益率", annual_return:"年化收益", sharpe:"夏普比率", max_drawdown:"最大回撤", win_rate:"胜率", profit_factor:"盈亏比", calmar:"卡玛比率", volatility:"年化波动", trade_count:"交易次数"};
 const fractions = new Set(["total_return","annual_return","max_drawdown","win_rate","volatility","turnover"]);
 function metric(key:string, value:any) {
@@ -104,7 +106,7 @@ onMounted(async () => {
       <div style="overflow:auto"><table><thead><tr><th>任务</th><th>状态 / 阶段</th><th>提交时间</th><th>操作</th></tr></thead>
         <tbody><tr v-for="job in history" :key="job.id">
           <td><router-link :to="{query:{job:job.id}}">{{job.id.slice(0,10)}}</router-link></td>
-          <td>{{statusLabels[job.state || job.status] || job.status}}<br/><small>{{job.progress}}</small></td>
+          <td :title="cnTitle(JOB_STATUS, job.state || job.status)">{{cn(JOB_STATUS, job.state || job.status)}}<br/><small>{{job.progress}}</small></td>
           <td>{{new Date(job.created*1000).toLocaleString()}}</td>
           <td><button v-if="['pending','running'].includes(job.status)" class="btn sm ghost" @click="cancel(job.id)">取消</button><button v-else-if="job.status==='error'" class="btn sm" @click="retry(job.id)">重跑</button><router-link v-else :to="{query:{job:job.id}}">查看报告</router-link></td>
         </tr><tr v-if="!history.length"><td colspan="4">暂无回测任务</td></tr></tbody>
@@ -120,12 +122,12 @@ onMounted(async () => {
       <p class="muted">{{report.equity_curve?.[0]?.date}} — {{report.equity_curve?.[report.equity_curve.length-1]?.date}}</p>
       <h4>成交明细（{{tradeTotal}} 笔）</h4>
       <div style="overflow:auto"><table><thead><tr><th>时间</th><th>标的</th><th>方向</th><th>价格</th><th>数量</th></tr></thead><tbody>
-        <tr v-for="(t,i) in trades" :key="i"><td>{{t.time || t.filled_at || t.trade_time || t.date}}</td><td>{{t.symbol}}</td><td>{{t.side}}</td><td>{{t.price}}</td><td>{{t.quantity ?? t.volume ?? t.shares}}</td></tr>
+        <tr v-for="(t,i) in trades" :key="i"><td>{{t.time || t.filled_at || t.trade_time || t.date}}</td><td>{{t.symbol}}</td><td :title="cnTitle(SIDE, t.side)">{{cn(SIDE, t.side)}}</td><td>{{t.price}}</td><td>{{t.quantity ?? t.volume ?? t.shares}}</td></tr>
         <tr v-if="!trades.length"><td colspan="5">本区间无成交</td></tr>
       </tbody></table></div>
       <button class="btn sm ghost" :disabled="offset===0" @click="page(-50)">上一页</button>
       <button class="btn sm ghost" :disabled="offset+50>=tradeTotal" @click="page(50)">下一页</button>
-      <details><summary>数据来源和覆盖</summary><p>{{report.data_sources?.join('、')}}</p><p>数据版本：{{report.data_hash}}</p><p v-for="(c,i) in report.coverage" :key="i">{{c.frequency}} · {{c.rows}} 行 · {{c.first}} — {{c.last}}</p></details>
+      <details><summary>数据来源和覆盖</summary><p>{{report.data_sources?.join('、')}}</p><p>数据版本：{{report.data_hash}}</p><p v-for="(c,i) in report.coverage" :key="i"><span :title="cnTitle(FREQ, c.frequency)">{{cn(FREQ, c.frequency)}}</span> · {{c.rows}} 行 · {{c.first}} — {{c.last}}</p></details>
     </section>
   </div>
 </template>

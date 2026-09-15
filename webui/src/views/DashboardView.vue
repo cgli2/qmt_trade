@@ -6,6 +6,9 @@ import { useRouter } from "vue-router";
 import api from "@/api";
 import { useApp } from "@/store";
 import { tryReq, pushToast } from "@/toast";
+import {
+  JOB_KIND, KILL_MODE, LEVEL, MODE, RUN_STATUS, TRADE_ACTION, cn, cnTitle,
+} from "@/labels";
 import Modal from "@/components/Modal.vue";
 
 const app = useApp();
@@ -145,7 +148,6 @@ async function saveSecret() {
 }
 
 // ---------- 调度任务展示 / 编辑 ----------
-const JOB_KIND_LABEL: Record<string, string> = { cron: "定时", interval: "高频" };
 
 function fmtNextRun(t?: string) {
   if (!t) return "-";
@@ -205,7 +207,6 @@ function killBadge(mode?: string) {
 function fmtDate(s: string) {
   return s && s.length === 8 ? `${s.slice(4, 6)}-${s.slice(6, 8)}` : s;
 }
-const ACTION_LABEL: Record<string, string> = { buy: "买入", sell: "卖出", hold: "持有", watch: "观察" };
 function actionClass(a: string) {
   if (a === "buy") return "ok";
   if (a === "sell") return "danger";
@@ -221,9 +222,6 @@ function fmtWan(v: number) {
 }
 function fmtSigned(v: number) { return (v > 0 ? "+" : "") + fmtWan(v); }
 
-const MODE_LABEL: Record<string, string> = { paper: "纸面交易", live: "实盘交易", sim: "模拟数据" };
-const KS_LABEL: Record<string, string> = { NORMAL: "正常", REDUCE_ONLY: "只减不加", FLATTEN: "强制清仓" };
-const LEVEL_LABEL: Record<string, string> = { INFO: "提示", WARN: "警告", ERROR: "严重" };
 function ksState(mode?: string) {
   if (mode === "NORMAL") return "st-ok";
   if (mode === "REDUCE_ONLY") return "st-warn";
@@ -264,7 +262,7 @@ watch(() => app.mode, load);
         <span class="ds-icon">🧭</span>
         <div class="ds-body">
           <div class="label">运行模式</div>
-          <div class="value">{{ MODE_LABEL[ov?.mode] || ov?.mode || "-" }}</div>
+          <div class="value" :title="cnTitle(MODE, ov?.mode)">{{ cn(MODE, ov?.mode) }}</div>
           <div class="tiny muted ds-sub">
             LLM 决策层
             <span class="badge sm" :class="ov?.llm_enabled ? 'ok' : 'muted'">
@@ -278,8 +276,8 @@ watch(() => app.mode, load);
         <div class="ds-body">
           <div class="label">交易总开关</div>
           <div class="value sm">
-            <span class="badge" :class="killBadge(ov?.killswitch?.mode)" :title="ov?.killswitch?.mode">
-              {{ KS_LABEL[ov?.killswitch?.mode] || ov?.killswitch?.mode || "-" }}
+            <span class="badge" :class="killBadge(ov?.killswitch?.mode)" :title="cnTitle(KILL_MODE, ov?.killswitch?.mode)">
+              {{ cn(KILL_MODE, ov?.killswitch?.mode) }}
             </span>
           </div>
           <div class="tiny muted ds-sub ellipsis-2">{{ ov?.killswitch?.reason || "运行正常，无降级原因" }}</div>
@@ -330,7 +328,7 @@ watch(() => app.mode, load);
             class="mini-item" to="/selection"
           >
             <b class="pill">{{ p.symbol }}</b>
-            <span class="badge sm" :class="actionClass(p.action)">{{ ACTION_LABEL[p.action] || p.action }}</span>
+            <span class="badge sm" :class="actionClass(p.action)" :title="cnTitle(TRADE_ACTION, p.action)">{{ cn(TRADE_ACTION, p.action) }}</span>
             <span class="tiny muted ellipsis">{{ (p.reason || "").slice(0, 60) }}</span>
           </router-link>
         </div>
@@ -374,12 +372,12 @@ watch(() => app.mode, load);
       <div class="card">
         <h3>🩺 健康体检</h3>
         <table>
-          <thead><tr><th>检查项</th><th>级别</th><th>状态</th><th>说明</th></tr></thead>
+          <thead><tr><th>检查项</th><th style="width:88px;white-space:nowrap">级别</th><th style="width:88px;white-space:nowrap">状态</th><th>说明</th></tr></thead>
           <tbody>
             <tr v-for="c in health?.checks || []" :key="c.name">
               <td>{{ c.name }}</td>
-              <td class="muted tiny">{{ LEVEL_LABEL[c.level] || c.level }}</td>
-              <td><span class="badge" :class="c.ok ? 'ok' : 'danger'">{{ c.ok ? "OK" : "FAIL" }}</span></td>
+              <td class="muted tiny" style="white-space:nowrap" :title="cnTitle(LEVEL, c.level)">{{ cn(LEVEL, c.level) }}</td>
+              <td style="white-space:nowrap"><span class="badge" :class="c.ok ? 'ok' : 'danger'" :title="cnTitle(RUN_STATUS, c.ok ? 'OK' : 'FAIL')">{{ c.ok ? "正常" : "异常" }}</span></td>
               <td class="tiny">{{ c.message }}</td>
             </tr>
             <tr v-if="!(health?.checks || []).length"><td colspan="4" class="muted">暂无数据</td></tr>
@@ -395,8 +393,8 @@ watch(() => app.mode, load);
             <tr v-for="j in health?.recent_jobs || []" :key="j.name">
               <td>{{ j.name }}</td>
               <td>
-                <span class="badge" :class="j.status === 'ok' ? 'ok' : (j.status === '-' ? 'muted' : 'warn')">
-                  {{ j.status }}
+                <span class="badge" :class="j.status === 'ok' ? 'ok' : (j.status === '-' ? 'muted' : 'warn')" :title="cnTitle(RUN_STATUS, j.status)">
+                  {{ cn(RUN_STATUS, j.status) }}
                 </span>
               </td>
               <td class="tiny muted">{{ j.last_run }}</td>
@@ -424,7 +422,7 @@ watch(() => app.mode, load);
             <td><b class="pill">{{ j.name }}</b></td>
             <td>
               <span class="badge sm" :class="j.kind === 'interval' ? 'info' : ''">
-                {{ JOB_KIND_LABEL[j.kind] || j.kind }}
+                {{ cn(JOB_KIND, j.kind) }}
               </span>
             </td>
             <td>

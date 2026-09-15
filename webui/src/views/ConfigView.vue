@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import {
+  CONFIG_KIND, cn, cnTitle,
+} from "@/labels";
 import { computed, onMounted, ref } from "vue";
 import api from "@/api";
 import { pushToast, tryReq } from "@/toast";
@@ -141,7 +144,7 @@ onMounted(load);
               <textarea v-else-if="l.kind === 'json'" v-model="l.value" rows="2"></textarea>
               <input v-else v-model="l.value" />
             </td>
-            <td class="tiny muted">{{ l.kind }}</td>
+            <td class="tiny muted" :title="cnTitle(CONFIG_KIND, l.kind)">{{ cn(CONFIG_KIND, l.kind) }}</td>
             <td class="tiny muted" style="line-height:1.5">{{ hintOf(l.path) }}</td>
           </tr>
           <tr v-if="!visible.length"><td colspan="4" class="muted">无匹配配置项</td></tr>

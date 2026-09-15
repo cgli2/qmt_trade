@@ -272,6 +272,15 @@ class JobRunner:
 
         healthy = hub.is_healthy()
         self.cache["universe"] = syms
+        # 记录跨 mode 共享的“行情同步水位”：data_freshness 体检据此判断数据是否停更。
+        # 走 shared_repos（paper/live 指向同一 schema），使任一 mode 的体检都读到同一
+        # 水位，而非各自 mode 隔离、可能长期不刷新的组合快照。失败不影响同步主流程。
+        try:
+            self.ctx.shared_repos.system.set(
+                "data:freshness", self.today.isoformat(),
+                reason=f"data_sync 抽样 {rows} 行")
+        except Exception as exc:                     # noqa: BLE001
+            logger.warning("data_sync 写入同步水位失败: %s", exc)
         return JobResult("data_sync", ok=bool(healthy),
                          reason="" if healthy else "存在熔断中的数据源",
                          data={"symbols": len(syms), "rows": rows})
@@ -1146,8 +1155,7 @@ class JobRunner:
             return JobResult("reconcile", skipped=True,
                              reason=f"{self.ctx.mode} 模式无券商可对账")
 
-        self.ctx.persist_portfolio(self.today)       # 先把内存账本刷进库再比
-        res = self.ctx.reconciler.run(self.today, broker)
+        res = self.ctx.reconcile_now(self.today)     # 统一入口：先刷库再比券商
         why = res.error or "; ".join(d.render() for d in res.blocking[:3])
         return JobResult("reconcile", ok=res.passed,
                          reason="" if res.passed else (why or "存在阻断级差异"),

@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import {
+  KILL_MODE, cn, cnTitle,
+} from "@/labels";
 import { computed, onMounted, ref, watch } from "vue";
 import api from "@/api";
 import { useApp } from "@/store";
@@ -94,7 +97,7 @@ watch(() => app.mode, load);
       <h3>🛡️ 交易总开关 <span class="sub">三态：NORMAL / REDUCE_ONLY（只减不加） / FLATTEN（强制清仓）</span></h3>
       <div class="row">
         <div style="flex:0 0 auto">
-          <span class="badge" :class="killBadge(data?.kill_mode)" style="font-size:13px">{{ data?.kill_mode || "-" }}</span>
+          <span class="badge" :class="killBadge(data?.kill_mode)" :title="cnTitle(KILL_MODE, data?.kill_mode)" style="font-size:13px">{{ data?.kill_mode ? cn(KILL_MODE, data.kill_mode) : "-" }}</span>
           <span class="tiny muted" style="margin-left:10px">{{ data?.kill_reason || "无降级原因" }}</span>
         </div>
         <div class="spacer"></div>

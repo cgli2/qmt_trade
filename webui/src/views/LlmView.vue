@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import {
+  PROVIDER_TYPE, cn, cnTitle,
+} from "@/labels";
 import { computed, onMounted, ref } from "vue";
 import api from "@/api";
 import { pushToast, tryReq } from "@/toast";
@@ -183,7 +186,7 @@ onMounted(load);
         <tbody>
           <tr v-for="p in cfg?.providers || []" :key="p.id">
             <td><b>{{ p.id }}</b></td>
-            <td><span class="badge muted">{{ p.type }}</span></td>
+            <td><span class="badge muted" :title="cnTitle(PROVIDER_TYPE, p.type)">{{ cn(PROVIDER_TYPE, p.type) }}</span></td>
             <td class="tiny">{{ p.base_url || "-" }}</td>
             <td class="tiny pill">{{ p.api_key_env || "-" }}</td>
             <td class="tiny muted">{{ p.timeout }}s / {{ p.max_retries }}</td>
@@ -289,7 +292,7 @@ onMounted(load);
       <div class="row">
         <div class="field"><label>ID *</label><input v-model="provDlg.id" placeholder="deepseek" /></div>
         <div class="field"><label>类型</label>
-          <select v-model="provDlg.type"><option value="openai_like">openai_like</option><option value="mock">mock</option></select>
+          <select v-model="provDlg.type"><option value="openai_like">OpenAI 兼容接口</option><option value="mock">本地模拟</option></select>
         </div>
       </div>
       <div class="field"><label>Base URL</label><input v-model="provDlg.base_url" placeholder="https://api.deepseek.com/v1" /></div>

@@ -11,6 +11,7 @@ from datetime import date, timedelta
 from fastapi import APIRouter, HTTPException, Query
 
 import server.context as ctx
+from qmt_trade.app import ContextError
 from qmt_trade.brain.schemas import TradeIntent
 from qmt_trade.core.trading import Side
 from qmt_trade.datahub.types import Adjust, Bar, Freq
@@ -172,7 +173,16 @@ def reconcile(date_: str | None = Query(None, alias="date"), mode: str = Query("
         return {"available": False,
                 "message": f"{c.mode} 模式没有券商可对账，请用 --mode live",
                 "killswitch": c.killswitch.mode.value}
-    res = c.reconciler.run(day, broker)
+    # 走统一入口：先把内存账本刷进库，再比券商。Reconciler 读的是库而不是
+    # portfolio，直接 run() 会拿一个还没落库的空账本去比 —— live 首用/清库后
+    # 恒报 POSITION_MISSING，页面上的「对账」永远过不了（2026-09-15 现场）。
+    # 注意必须在上面的早退之后：paper 没有券商可对，不该被顺手写进一条快照。
+    try:
+        res = c.reconcile_now(day)
+    except ContextError as exc:
+        return {"available": False,
+                "message": f"对账未完成：{exc}（已按券商不可用处理，宁可不交易也不用假账本）",
+                "killswitch": c.killswitch.mode.value}
     return {"available": True, "passed": res.passed,
             "checked": res.checked, "discrepancies": res.discrepancies,
             "render": res.render()}

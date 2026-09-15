@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 import logging
+import os
+import tempfile
 
 import sys
 from datetime import date
@@ -19,7 +21,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from qmt_trade.core.config import Settings                       # noqa: E402
+# 后端常驻时独占 data/db/qmt.duckdb，而 Settings.load() 会经 read_active 去开它。
+# 指向一个不存在的临时文件让 read_active 直接返回 None（纯读 YAML），
+# 测试结果因此与"后端是否在跑""页面是否改过配置"都无关。
+os.environ["QMT_RUNTIME_DB"] = str(
+    Path(tempfile.mkdtemp(prefix="qmt_smoke_reconcile_")) / "smoke.duckdb")
+os.environ.setdefault("QMT_ALLOW_LIVE", "1")
+os.environ.setdefault("QMT_ACCOUNT_ID", "smoke-live-account")
+
+from qmt_trade.app import TradingContext                    # noqa: E402
+from qmt_trade.core.config import Settings                  # noqa: E402
 from qmt_trade.execution.reconcile import (                      # noqa: E402
     Discrepancy, Reconciler, ReconcileResult,
 )
@@ -54,11 +65,13 @@ def kinds(res: ReconcileResult) -> list[str]:
 class FakeBroker:
     """券商只读视图的替身。``boom`` 用于模拟查询超时/断线。"""
 
-    def __init__(self, positions=None, cash=None, trades=None, *, boom: str = ""):
+    def __init__(self, positions=None, cash=None, trades=None, *, boom: str = "",
+                 total_asset=None):
         self._positions = positions or []
         self._cash = cash
         self._trades = trades or []
         self.boom = boom
+        self._total_asset = total_asset
         self.calls: list[str] = []
 
     def query_positions(self):
@@ -71,7 +84,12 @@ class FakeBroker:
         self.calls.append("asset")
         if self.boom == "asset":
             raise ConnectionError("行情端口未就绪")
-        return {} if self._cash is None else {"cash": self._cash}
+        if self._cash is None:
+            return {}
+        out = {"cash": self._cash}
+        if self._total_asset is not None:
+            out["total_asset"] = self._total_asset
+        return out
 
     def query_trades(self, trade_date):
         self.calls.append("trades")
@@ -450,6 +468,248 @@ def test_structs() -> None:
     check("裸配置也能跑", res.passed)
 
 
+# ============================================== 实盘基线采纳（Gate-3 的前置真值）
+# 2026-09-15 实盘对账报 CASH_MISMATCH「本地=1000000.0 券商=53608.39」，
+# 根因不在对账逻辑，而在账本建立的那一刻：live 首次建仓本时用了
+# backtest.initial_cash 当起始现金，虚构值被 persist_portfolio 写进
+# account_snapshots，Gate-3 再把它当「本地真值」去比券商。
+# 下面这组测的是硬纪律：**实盘账本的真值只能来自券商，绝不能来自回测配置。**
+LIVE_CASH = 53_608.39
+LIVE_MV = 12_490.0 + 116_634.0          # 券商口径持仓市值 = 129,124.00
+LIVE_TOTAL = LIVE_CASH + LIVE_MV        # 现金 + 市值 = 券商 total_asset 182,732.39
+LIVE_POSITIONS = [
+    {"symbol": "600216.SH", "volume": 1000, "can_use": 1000,
+     "avg_cost": 14.1059, "market_value": 12_490.0},
+    {"symbol": "300570.SZ", "volume": 600, "can_use": 600,
+     "avg_cost": 234.12241666666668, "market_value": 116_634.0},
+]
+
+
+def _live_ctx(broker, repos, ks=None, notifier=None) -> TradingContext:
+    return TradingContext(_settings(), mode="live", repos=repos,
+                          gateway=broker, killswitch=ks, notifier=notifier)
+
+
+class _SilentNotifier:
+    """记录而不真的外发。RED 阶段对账会失败，绝不能把测试消息推到企业微信。"""
+
+    def __init__(self):
+        self.sent: list[tuple] = []
+
+    def notify(self, title, **kw):
+        self.sent.append((title, kw))
+        return True
+
+
+def test_live_baseline() -> None:
+    st = _settings()
+    bt_cash = float(st.get("backtest.initial_cash", 1_000_000) or 0)
+
+    logger.info("\n[36] 实盘基线 —— 空账本必须采纳券商真实现金")
+    repos = Repos.create(Database(":memory:"))
+    broker = FakeBroker(positions=LIVE_POSITIONS, cash=LIVE_CASH,
+                        total_asset=LIVE_TOTAL)
+    ctx = _live_ctx(broker, repos)
+    try:
+        check("建账本前确实为空", repos.snapshots.latest() is None
+              and repos.positions.list_all() == [])
+        ps = ctx.portfolio
+        check("现金=券商真值", abs(ps.cash - LIVE_CASH) < 0.01, f"{ps.cash:,.2f}")
+        check("绝不用回测本金", abs(ps.cash - bt_cash) > 1.0,
+              f"backtest.initial_cash={bt_cash:,.0f}")
+        check("确实查了券商", "asset" in broker.calls, str(broker.calls))
+    finally:
+        ctx.close()
+
+    logger.info("\n[37] 实盘基线 —— 券商持仓一并采纳入库")
+    check("两只票都在账本里",
+          set(ps.positions) == {"600216.SH", "300570.SZ"}, str(sorted(ps.positions)))
+    p = ps.positions.get("600216.SH")
+    check("股数采纳", p is not None and p.shares == 1000,
+          str(p.shares if p else None))
+    check("成本价采纳", p is not None and abs(p.avg_cost - 14.1059) < 1e-6,
+          str(p.avg_cost if p else None))
+    check("可卖量采纳（T+1 口径）", p is not None and p.can_use == 1000,
+          str(p.can_use if p else None))
+    # 券商只给市值不给现价；按成本价估值会让浮亏仓位「看起来没亏」，
+    # total_asset / peak_asset 虚高，之后真实回撤被放大甚至误触拉闸。
+    check("现价按券商市值反推，不拿成本价充数",
+          p is not None and abs(p.last_price - 12.49) < 1e-6,
+          f"last_price={p.last_price if p else None} avg_cost=14.1059")
+    check("浮亏仓位现价也按市值反推（116634/600=194.39）",
+          abs(ps.positions["300570.SZ"].last_price - 194.39) < 1e-6,
+          f"last_price={ps.positions['300570.SZ'].last_price} "
+          f"avg_cost={ps.positions['300570.SZ'].avg_cost:.4f}")
+    check("反推出的浮亏与券商一致（合计 -25455.35）",
+          abs(sum((q.last_price - q.avg_cost) * q.shares
+                  for q in ps.positions.values()) - (-25_455.35)) < 1.0,
+          f"{sum((q.last_price - q.avg_cost) * q.shares for q in ps.positions.values()):,.2f}")
+    check("持仓市值=券商市值口径", abs(ps.position_value - LIVE_MV) < 0.01,
+          f"{ps.position_value:,.2f} vs {LIVE_MV:,.2f}")
+    check("总资产=现金+券商市值", abs(ps.total_asset - LIVE_TOTAL) < 0.01,
+          f"{ps.total_asset:,.2f} vs {LIVE_TOTAL:,.2f}")
+    check("已落库到 positions 表",
+          {r["symbol"]: int(r["volume"]) for r in repos.positions.list_all()}
+          == {"600216.SH": 1000, "300570.SZ": 600},
+          str(repos.positions.list_all()))
+
+    logger.info("\n[38] 实盘基线 —— 落库快照，重启后以库为准不再重复采纳")
+    snap = repos.snapshots.latest()
+    check("写入当日快照", snap is not None, str(snap))
+    check("快照现金=券商真值",
+          snap is not None and abs(float(snap["cash"]) - LIVE_CASH) < 0.01,
+          str(snap["cash"] if snap else None))
+    check("初始资产=券商总资产", abs(ps.initial_asset - LIVE_TOTAL) < 0.01,
+          f"{ps.initial_asset:,.2f}")
+    check("快照总资产=券商总资产（落库口径一致）",
+          snap is not None and abs(float(snap["total_asset"]) - LIVE_TOTAL) < 0.01,
+          str(snap["total_asset"] if snap else None))
+    broker2 = FakeBroker(positions=[], cash=1.0)      # 券商口径已变，但应走库
+    ctx2 = _live_ctx(broker2, repos)
+    try:
+        check("重启从库还原", abs(ctx2.portfolio.cash - LIVE_CASH) < 0.01,
+              f"{ctx2.portfolio.cash:,.2f}")
+        check("重启不再查券商", broker2.calls == [], str(broker2.calls))
+        check("重启持仓也还原",
+              set(ctx2.portfolio.positions) == {"600216.SH", "300570.SZ"},
+              str(sorted(ctx2.portfolio.positions)))
+    finally:
+        ctx2.close()
+
+    logger.info("\n[39] 实盘基线 —— 采纳之后 Gate-3 应当直接通过")
+    res = Reconciler(st, repos=repos).run(D, broker, notify=False)
+    check("对账通过", res.passed, str(kinds(res)))
+    check("无 POSITION_MISSING", "POSITION_MISSING" not in kinds(res), str(kinds(res)))
+    check("无 CASH_MISMATCH", "CASH_MISMATCH" not in kinds(res), str(kinds(res)))
+
+    logger.info("\n[40] 实盘基线 —— 券商不可用时宁可不交易，绝不建假账本")
+    for name, kw in (("查询抛异常", {"cash": None, "boom": "asset"}),
+                     ("未返回现金字段", {"cash": None})):
+        repos3 = Repos.create(Database(":memory:"))
+        ks = KillSwitch()
+        ctx3 = _live_ctx(FakeBroker(positions=LIVE_POSITIONS, **kw), repos3, ks)
+        try:
+            raised = False
+            try:
+                ctx3.portfolio
+            except Exception:                          # noqa: BLE001
+                raised = True
+            check(f"{name} —— 必须抛出而非静默兜底", raised)
+            check(f"{name} —— 已拉闸", ks.mode is KillMode.REDUCE_ONLY, ks.mode.value)
+            check(f"{name} —— 未写入假快照", repos3.snapshots.latest() is None,
+                  str(repos3.snapshots.latest()))
+        finally:
+            ctx3.close()
+
+    logger.info("\n[41] 模拟盘 —— 仍用初始现金，不去查券商")
+    repos4 = Repos.create(Database(":memory:"))
+    broker4 = FakeBroker(positions=LIVE_POSITIONS, cash=LIVE_CASH)
+    ctx4 = TradingContext(st, mode="paper", repos=repos4, gateway=broker4)
+    try:
+        check("paper 用 backtest.initial_cash",
+              abs(ctx4.portfolio.cash - bt_cash) < 0.01,
+              f"{ctx4.portfolio.cash:,.2f}")
+        check("paper 不查券商", broker4.calls == [], str(broker4.calls))
+        check("paper 不采纳券商持仓", ctx4.portfolio.positions == {},
+              str(sorted(ctx4.portfolio.positions)))
+    finally:
+        ctx4.close()
+
+    logger.info("\n[42] Web 对账入口 —— 必须先刷内存账本，否则空账本恒报 POSITION_MISSING")
+    # 调度作业 reconcile 一直是「先 persist_portfolio 再比」（jobs.py 注释：
+    # 先把内存账本刷进库再比）。HTTP 端点若绕过这一步，用户在页面上点「对账」
+    # 就是拿一个还没落库的账本去比券商 —— 2026-09-15 现场正是从 Web 触发的。
+    import server.context as srv_ctx
+    import server.routers.trade as trade_router
+
+    repos5 = Repos.create(Database(":memory:"))
+    broker5 = FakeBroker(positions=LIVE_POSITIONS, cash=LIVE_CASH,
+                         total_asset=LIVE_TOTAL)
+    ctx5 = _live_ctx(broker5, repos5, ks=KillSwitch(), notifier=_SilentNotifier())
+    orig_make_ctx = srv_ctx.make_ctx
+    srv_ctx.make_ctx = lambda mode="paper": ctx5
+    try:
+        check("对账前 live 账本确实为空", repos5.snapshots.latest() is None)
+        out = trade_router.reconcile(date_=None, mode="live")
+        got = [d.kind for d in (out.get("discrepancies") or [])]
+        check("Web 对账通过", out.get("passed") is True, str(got))
+        check("Web 对账无 POSITION_MISSING", "POSITION_MISSING" not in got, str(got))
+        check("Web 对账无 CASH_MISMATCH", "CASH_MISMATCH" not in got, str(got))
+        check("基线已落库（重启后走库，不再重复采纳）",
+              repos5.snapshots.latest() is not None, str(repos5.snapshots.latest()))
+    finally:
+        srv_ctx.make_ctx = orig_make_ctx
+        ctx5.close()
+
+    logger.info("\n[43] Web 对账入口 —— 无券商可对时必须早退，绝不顺手写库")
+    # paper 的真实网关是 SimGateway（没有 query_positions），刷库必须放在这个
+    # 早退之后，否则页面点一次「对账」就会给模拟盘凭空写一条快照。
+    class _SimLike:
+        """与 SimGateway 同形状：可撮合，但没有券商只读视图。"""
+
+    repos6 = Repos.create(Database(":memory:"))
+    ctx6 = TradingContext(st, mode="paper", repos=repos6, gateway=_SimLike())
+    srv_ctx.make_ctx = lambda mode="paper": ctx6
+    try:
+        out6 = trade_router.reconcile(date_=None, mode="paper")
+        check("paper 返回 available=False", out6.get("available") is False, str(out6))
+        check("paper 未被写入任何快照", repos6.snapshots.latest() is None,
+              str(repos6.snapshots.latest()))
+    finally:
+        srv_ctx.make_ctx = orig_make_ctx
+        ctx6.close()
+
+    logger.info("\n[44] CLI 离线对账入口 —— 同样必须先刷库再比券商")
+    # cmd_reconcile 的离线分支若直接调 reconciler.run（跳过 reconcile_now 里的
+    # persist_portfolio），空账本时读不到本地持仓，会把券商真实持仓全判成
+    # POSITION_MISSING —— 与 Web 入口 [42] 是同一个坑。4 条对账路径（调度作业 /
+    # HTTP / CLI 在线 / CLI 离线）必须共用 reconcile_now 这一个入口。
+    from unittest.mock import patch
+    from qmt_trade import cli as cli_mod
+
+    repos7 = Repos.create(Database(":memory:"))
+    broker7 = FakeBroker(positions=LIVE_POSITIONS, cash=LIVE_CASH,
+                         total_asset=LIVE_TOTAL)
+    ctx7 = _live_ctx(broker7, repos7, ks=KillSwitch(), notifier=_SilentNotifier())
+
+    # 用调用日志证明「先刷库、后比对」的顺序。不能只 spy reconciler.run ——
+    # reconcile_now 内部也会调它；真正的判据是 persist_portfolio 有没有先跑。
+    calls7: list[str] = []
+    _orig_persist7 = ctx7.persist_portfolio
+
+    def _spy_persist7(d=None):
+        calls7.append("persist")
+        return _orig_persist7(d)
+
+    ctx7.persist_portfolio = _spy_persist7
+    _rec7 = ctx7.reconciler
+    _orig_run7 = _rec7.run
+
+    def _spy_run7(*a, **kw):
+        calls7.append("run")
+        return _orig_run7(*a, **kw)
+
+    _rec7.run = _spy_run7
+
+    class _Args7:
+        mode = "live"
+        config = None
+        db = None
+        date = D.isoformat()
+        ack = None
+        operator = None
+
+    with patch.object(cli_mod, "build_context", lambda *a, **kw: ctx7):
+        rc7 = cli_mod.cmd_reconcile(_Args7())
+
+    check("CLI 离线对账通过（rc=0）", rc7 == 0, f"rc={rc7}")
+    check("先刷库再比对（reconcile_now 语义，而非直接 reconciler.run）",
+          "persist" in calls7 and "run" in calls7
+          and calls7.index("persist") < calls7.index("run"), str(calls7))
+    check("基线已落库（重启后走库，不再重复采纳）",
+          repos7.snapshots.latest() is not None, str(repos7.snapshots.latest()))
+
+
 def main() -> int:
     logger.info("=" * 64)
     logger.info("Gate-3 盘后对账 冒烟测试")
@@ -461,6 +721,7 @@ def main() -> int:
     test_integration()
     test_acknowledge()
     test_structs()
+    test_live_baseline()
     logger.info("\n" + "=" * 64)
     logger.info(f"结果: {PASS} 通过 / {FAIL} 失败")
     logger.info("=" * 64)

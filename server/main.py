@@ -23,6 +23,26 @@ from server.routers import (backtest, backtests, config, datasource, event, llm,
                             memory, notify, overview, report, risk, selection,
                             strategy, strategylab, tail_pick, trade)
 
+# ------------------------------------------------------------------ 日志初始化
+# 后端经 `uvicorn server.main:app` 启动，不走 cli.py 的 setup_logging()。若不在此
+# 显式初始化，qmt_trade.* 与 server.* 都没有 handler：INFO 日志（常驻调度器启动、
+# 当日错过任务的补跑链路、每个任务 run_job→_fire 的结果 render）全部丢失，只有
+# WARNING+ 经 logging.lastResort 落到 stderr→backend.log。排查“data_sync/reconcile
+# 到底跑没跑、返回了什么”时因此成了盲区（RC2）。console handler 写 stdout，被
+# scripts/start_backend.sh 收进 logs/backend.log；幂等，重复 import 不会重复挂。
+from qmt_trade.core.logging import setup_logging
+
+_qmt_logger = setup_logging(level="INFO", console=True)
+# setup_logging 只覆盖 "qmt_trade" 命名空间；server.* 走 Python 根 logger，复用同一
+# 批 handler 并关掉向根传播，让后端自身日志（server.main / server.routers.*）同样可见，
+# 且不会与 qmt_trade 日志重复输出。
+_server_logger = logging.getLogger("server")
+_server_logger.setLevel(logging.INFO)
+_server_logger.propagate = False
+for _h in _qmt_logger.handlers:
+    if _h not in _server_logger.handlers:
+        _server_logger.addHandler(_h)
+
 logger = logging.getLogger(__name__)
 DIST = Path(__file__).resolve().parent.parent / "webui" / "dist"
 

@@ -1,4 +1,12 @@
 <script setup lang="ts">
+import {
+  AGENT, CONVICTION, STANCE, TRADE_ACTION, VERDICT,
+} from "@/labels";
+
+const ACTION_LABEL = TRADE_ACTION;
+const AGENT_LABEL = AGENT;
+const VERDICT_LABEL = VERDICT;
+
 // 选股研判：一页看全「策略 → 漏斗候选池 → 多 Agent 最终精选(3~5只，含理由/投票/辩论)」，
 // 并提供一键选股、策略切换、AI 研判、重点研究清单管理、跳转行情/交易的快捷入口。
 import { onMounted, ref, reactive, watch, computed, inject } from "vue";
@@ -241,24 +249,14 @@ function actionClass(a: string) {
   if (a === "hold" || a === "watch") return "info";
   return "muted";
 }
-const ACTION_LABEL: Record<string, string> = {
-  buy: "买入", sell: "卖出", hold: "持有", watch: "观察",
-};
 function convictionClass(v: string) {
   if (v === "high") return "ok";
   if (v === "low") return "danger";
   return "info";
 }
-const CONVICTION_LABEL: Record<string, string> = { high: "高确信", mid: "中确信", low: "低确信" };
+const CONVICTION_LABEL = CONVICTION;
 
 // ---------- 投票可读化翻译 ----------
-const AGENT_LABEL: Record<string, string> = {
-  technical: "技术面", fundamental: "基本面", moneyflow: "资金面", sentiment: "市场情绪",
-  research_manager: "研究主管", portfolio_manager: "组合经理", risk_officer: "风控官",
-};
-const VERDICT_LABEL: Record<string, string> = {
-  BULL: "看多", BEAR: "看空", NEUTRAL: "中性", BUY: "看多", SELL: "看空", HOLD: "持有",
-};
 const FACTOR_CN: Record<string, string> = {
   close_price: "最新收盘价", close: "最新收盘价", price: "最新收盘价", entry: "买入价",
   high_60d: "60日最高价", score_percentile: "综合分全市场分位",
@@ -330,7 +328,7 @@ function fmtDate(s: string) {
 }
 
 // ---------- 辩论 / 证据 展示辅助 ----------
-const STANCE_LABEL: Record<string, string> = { BULL: "看多", BEAR: "看空", NEUTRAL: "中性" };
+const STANCE_LABEL = STANCE;
 function stanceClass(s: string) {
   const x = String(s).toUpperCase();
   return ["BULL", "BUY"].includes(x) ? "ok" : ["BEAR", "SELL"].includes(x) ? "danger" : "muted";
