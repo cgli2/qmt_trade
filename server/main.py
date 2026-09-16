@@ -62,6 +62,26 @@ def _ran_today(runner, name: str) -> bool:
         return False
 
 
+def _resolve_scheduler_mode() -> str:
+    """常驻调度器运行模式：默认 ``paper``（真实数据源 + 模拟撮合，绝不下真单）。
+
+    可经 ``settings.yaml`` 的 ``scheduler.mode`` 或环境变量 ``QMT_SCHEDULER__MODE``
+    改为 ``live``。此前 main.py 硬编码 ``make_ctx("paper")``，造成「UI 看 live、
+    自动交易跑 paper」的错位（2026-09-15 事故：paper 侧熔断拒单，用户却在 live
+    页面排查）。改为可配置，并由 ``/overview`` 把实际模式暴露给前端。
+    live 仍受观察期护栏约束：未设 ``QMT_ALLOW_LIVE`` 时自动回落 paper 并告警。
+    """
+    from qmt_trade.core.config import get_settings
+    mode = str(get_settings().get("scheduler.mode", "paper") or "paper").strip().lower()
+    if mode not in ("paper", "live"):
+        logger.warning("scheduler.mode=%r 非法（仅 paper/live），回落 paper", mode)
+        return "paper"
+    if mode == "live" and ctx.is_live_locked():
+        logger.warning("scheduler.mode=live 但观察期护栏未解锁（缺 QMT_ALLOW_LIVE），回落 paper")
+        return "paper"
+    return mode
+
+
 def _catchup(runner, sched) -> None:
     """补跑当日已错过的任务。research 很重（半小时以上），放独立线程跑，
     完成后若 plan 已跑过则再刷一次 plan，让开仓计划用上最新精选。"""
@@ -142,16 +162,18 @@ def _catchup_research(runner) -> None:
 async def lifespan(app: FastAPI):
     ctx.backtest_service().start()
     sched = None
+    sched_mode = _resolve_scheduler_mode()
+    app.state.scheduler_mode = sched_mode
     try:
         from qmt_trade.scheduler.jobs import JobRunner
         from qmt_trade.scheduler.runner import TradingScheduler
 
-        runner = JobRunner(ctx.make_ctx("paper"))
+        runner = JobRunner(ctx.make_ctx(sched_mode))
         sched = TradingScheduler(runner)
         app.state.runner = runner
         app.state.scheduler = sched
         if sched.start():
-            logger.info("常驻调度器已启动\n%s", sched.describe())
+            logger.info("常驻调度器已启动（mode=%s）\n%s", sched_mode, sched.describe())
             threading.Thread(target=_catchup, args=(runner, sched),
                              name="catchup", daemon=True).start()
     except Exception:                                   # noqa: BLE001

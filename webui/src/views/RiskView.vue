@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {
-  KILL_MODE, cn, cnTitle,
+  KILL_ACTION, KILL_MODE, cn, cnTitle,
 } from "@/labels";
 import { computed, onMounted, ref, watch } from "vue";
 import api from "@/api";
@@ -15,9 +15,9 @@ const form = ref<Record<string, any>>({});
 const origin = ref<Record<string, any>>({});
 
 const GATE_DESC: Record<string, string> = {
-  gate1: "Gate1 组合层 · 持仓数 / 集中度 / 行业暴露 / 总仓位上限",
-  gate2: "Gate2 个股层 · 单票权重 / 流动性 / 涨跌停 / 停牌与 ST 过滤",
-  gate3: "Gate3 订单层 · 单笔金额 / 冲击成本 / 频次 / 追单限制",
+  gate1: "第一道闸门 · 组合层 · 持仓数 / 集中度 / 行业暴露 / 总仓位上限",
+  gate2: "第二道闸门 · 个股层 · 单票权重 / 流动性 / 涨跌停 / 停牌与 ST 过滤",
+  gate3: "第三道闸门 · 订单层 · 单笔金额 / 冲击成本 / 频次 / 追单限制",
 };
 
 function flat(prefix: string, obj: any, out: Record<string, any>) {
@@ -68,8 +68,8 @@ async function save() {
 }
 
 async function kill(action: string) {
-  if (action !== "reset" && !confirm(`确认 ${action}？将立即改变交易权限。`)) return;
-  const r = await tryReq(() => api.setKillswitch(app.mode, action), `总开关已 ${action}`);
+  if (action !== "reset" && !confirm(`确认「${cn(KILL_ACTION, action)}」？将立即改变交易权限。`)) return;
+  const r = await tryReq(() => api.setKillswitch(app.mode, action), `总开关已${cn(KILL_ACTION, action)}`);
   if (r) load();
 }
 
@@ -94,21 +94,21 @@ watch(() => app.mode, load);
 <template>
   <div :class="{ loading }">
     <div class="card">
-      <h3>🛡️ 交易总开关 <span class="sub">三态：NORMAL / REDUCE_ONLY（只减不加） / FLATTEN（强制清仓）</span></h3>
+      <h3>🛡️ 交易总开关 <span class="sub">三态：正常 / 只减不加 / 强制清仓</span></h3>
       <div class="row">
         <div style="flex:0 0 auto">
           <span class="badge" :class="killBadge(data?.kill_mode)" :title="cnTitle(KILL_MODE, data?.kill_mode)" style="font-size:13px">{{ data?.kill_mode ? cn(KILL_MODE, data.kill_mode) : "-" }}</span>
           <span class="tiny muted" style="margin-left:10px">{{ data?.kill_reason || "无降级原因" }}</span>
         </div>
         <div class="spacer"></div>
-        <button class="btn warn" style="flex:0 0 auto" @click="kill('engage')">降级 REDUCE_ONLY</button>
-        <button class="btn danger" style="flex:0 0 auto" @click="kill('flatten')">FLATTEN</button>
-        <button class="btn ghost" style="flex:0 0 auto" @click="kill('reset')">恢复 NORMAL</button>
+        <button class="btn warn" style="flex:0 0 auto" @click="kill('engage')">降级为只减不加</button>
+        <button class="btn danger" style="flex:0 0 auto" @click="kill('flatten')">强制清仓</button>
+        <button class="btn ghost" style="flex:0 0 auto" @click="kill('reset')">恢复正常</button>
       </div>
     </div>
 
     <div class="card">
-      <h3>三道风控闸门 <span class="sub">规则先行：任一 Gate 拒绝即拦截，LLM 无权覆盖</span>
+      <h3>三道风控闸门 <span class="sub">规则先行：任一道闸门拒绝即拦截，LLM 无权覆盖</span>
         <div class="spacer"></div>
         <button class="btn sm ghost" @click="load">刷新</button>
         <button class="btn sm" style="margin-left:6px" @click="save">保存（{{ dirty.length }}）</button>

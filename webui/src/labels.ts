@@ -33,6 +33,14 @@ export const KILL_MODE: Dict = withCase({
   FLATTEN: "强制清仓",
 });
 
+// KillSwitch 操作动作 → 中文（确认弹窗/Toast 文案用）。
+// 来源：server /system/killswitch 接受的 action 值（engage/flatten/reset）
+export const KILL_ACTION: Dict = withCase({
+  engage: "降级为只减不加",
+  flatten: "强制清仓",
+  reset: "恢复正常",
+});
+
 // 告警级别。来源：qmt_trade/ops/notify.py Level、qmt_trade/scheduler/jobs.py severity
 export const LEVEL: Dict = withCase({
   DEBUG: "调试",
@@ -148,6 +156,17 @@ export const JOB_KIND: Dict = withCase({
   interval: "高频",
 });
 
+// 调度任务启用状态。来源：server/routers/overview.py /scheduler/jobs 的 status 字段
+// （由 qmt_trade/scheduler/runner.py JobSpec.status 产出）
+// running  = 在跑；
+// paused   = 用户在工作台手动暂停（可就地恢复）；
+// disabled = 绑定策略未启用，随策略门禁摘除（要去「策略实验室」开策略）。
+export const JOB_STATE: Dict = withCase({
+  running: "运行中",
+  paused: "已暂停",
+  disabled: "已停用",
+});
+
 // 运行模式。来源：server 全局 mode
 export const MODE: Dict = withCase({
   sim: "模拟数据",
@@ -236,6 +255,80 @@ export const REGIME: Dict = withCase({
   TREND_DOWN: "下行趋势",
   RISK_OFF: "避险",
 });
+
+// ---------- 复盘 / 报告（经验标签·策略·因子） ----------
+// 复盘经验标签 → 中文。大写来源 review.py Lesson.tag；小写来源 reflection.py
+// _long_term_candidates 的 tag（factor_ic/regime/selection/recent/lesson），仅在记忆面板 pill 上出现。
+export const LESSON_TAG: Dict = withCase({
+  FACTOR_INVERTED: "因子反向",
+  SAMPLE_TOO_SMALL: "样本过小",
+  COST_DRAG_HIGH: "费用拖累偏高",
+  STOP_TOO_TIGHT: "止损过紧",
+  CONVICTION_INVERTED: "确信度分档失效",
+  CUT_WINNERS_EARLY: "盈利单过早了结",
+  factor_ic: "因子IC",
+  regime: "市场状态",
+  selection: "选股有效性",
+  recent: "近期经验",
+  lesson: "经验",
+});
+
+// 策略预设 / 独立策略 id → 中文。来源：qmt_trade/core/strategies.py _PRESET_META / _STANDALONE_META
+export const STRATEGY: Dict = {
+  balanced: "均衡多因子",
+  momentum_breakout: "动量突破",
+  value_quality: "价值质量",
+  moneyflow_resonance: "资金流共振",
+  low_vol_defensive: "低波防御",
+  tail_pick: "尾盘选股法",
+  limit_up: "打板策略",
+  second_board: "二板龙头战法",
+  dip_buy: "尾盘潜伏低吸",
+  trend_buy: "趋势类买点",
+  etf_t0: "ETF T+0 日内回转",
+  stock_t0: "个股做T",
+};
+
+// 因子大类 → 中文。来源：qmt_trade/core/strategy_catalog.py cat_zh
+export const CAT_CN: Dict = {
+  momentum: "量价动量",
+  moneyflow: "资金流",
+  sentiment: "消息情绪",
+  fundamental: "基本面",
+  quality: "质量",
+};
+
+// 因子名 → 中文（全项目唯一来源）。来源：qmt_trade/features/factors/*.py 的 @_R(name, category, desc)
+// 注册，以及 SelectionView 失效表达式(invalidation_checks) 里出现的别名。
+export const FACTOR: Dict = {
+  // 量价动量
+  ret_20d: "20日收益率", ret_60d: "60日收益率", ret_5d_rev: "5日短期反转",
+  mom_12_1: "12-1动量", ma_align: "均线多头排列强度", ma_bullish_score: "均线多头排列分",
+  bias_20: "20日乖离率", breakout_60: "距60日高点接近度",
+  close_ratio_60d_high: "价格相对60日高点比", distance_from_60d_high: "距60日高点距离",
+  high_60d: "60日最高价", atr_ratio: "ATR占价比", downside_vol: "20日下行波动率",
+  max_drawdown_60: "60日最大回撤", vol_ratio_5_20: "量比5/20",
+  turnover_stability: "换手率稳定性", amount_liquidity: "20日均成交额对数",
+  price_volume_corr: "20日价量相关性", limit_up_count_20: "近20日涨停次数",
+  turnover_rate: "换手率",
+  // 消息情绪
+  news_sentiment_5d: "近5日新闻情感", news_heat_5d: "近5日新闻条数",
+  event_sentiment_20d: "近20日公告情感", hard_negative_flag: "严重负面事件标记",
+  hard_negative_event: "严重负面事件", industry_momentum: "行业动量",
+  // 基本面 / 质量
+  roe: "净资产收益率", gross_margin: "毛利率", profit_yoy: "净利润同比增速",
+  net_profit_yoy: "净利同比", revenue_yoy: "营收同比增速",
+  earnings_yield: "盈利收益率", ep_ratio: "盈利收益率",
+  debt_safety_score: "偿债安全分", debt_safety: "偿债安全分",
+  // 资金流
+  main_net_5d: "主力资金5日净流入", main_net_10d: "主力资金10日净流入",
+  main_net_ratio: "主力净流入占成交比", large_order_ratio: "近5日大单占比均值",
+  flow_consistency: "资金流方向一致性",
+  // 表达式 / 其他别名
+  close_price: "最新收盘价", close: "最新收盘价", price: "最新收盘价", entry: "买入价",
+  score: "综合分", score_percentile: "综合分全市场分位",
+  missing_fields_count: "数据缺失字段数", days_between: "间隔天数",
+};
 
 // ---------- 事件 ----------
 // 来源：qmt_trade/datahub/types.py EventCategory
@@ -339,4 +432,36 @@ export function cnTitle(dict: Dict, v: unknown): string {
   if (!s) return "";
   const t = dict[s];
   return t && t !== s ? s : "";
+}
+
+// ---------- 混排文本就地翻译 ----------
+// 复盘报告正文/记忆面板是中英混排的自由文本（如「当前 TREND_DOWN 市况，建议切换至
+// `low_vol_defensive` 策略」「因子 `ret_20d_q` 方向可能反了」）。这里按标识符 token 逐个查表翻译，
+// 仅替换已收录的枚举码/因子名/策略 id，其余原样保留，不改后端契约。
+function trToken(tok: string): string {
+  // X_q → <X>分位（engine.py 截面分位化因子，如 ret_20d_q）
+  if (tok.endsWith("_q")) {
+    const base = tok.slice(0, -2);
+    if (FACTOR[base]) return FACTOR[base] + "分位";
+  }
+  // cat_X → <X>类因子（大类聚合因子，如 cat_momentum）
+  if (tok.startsWith("cat_")) {
+    const c = tok.slice(4);
+    if (CAT_CN[c]) return CAT_CN[c] + "类因子";
+  }
+  if (FACTOR[tok]) return FACTOR[tok];
+  if (STRATEGY[tok]) return STRATEGY[tok];
+  // 经验标签/市况/级别只译全大写形态（正文里它们以大写出没，如 [WARN]、FACTOR_INVERTED、TREND_DOWN），
+  // 避免误伤正文中的普通英文小写词；小写标签（factor_ic/regime/…）只在记忆面板 pill 上单独翻译。
+  if (tok === tok.toUpperCase()) {
+    return LESSON_TAG[tok] ?? REGIME[tok] ?? LEVEL[tok] ?? tok;
+  }
+  return tok;
+}
+
+/** 就地把混排文本中的英文码译为中文；仅替换已收录 token，其余原样保留。 */
+export function translateText(s: unknown): string {
+  const t = raw(s);
+  if (!t) return "";
+  return t.replace(/[A-Za-z_][A-Za-z0-9_]*/g, (m) => trToken(m));
 }

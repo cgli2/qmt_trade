@@ -18,6 +18,16 @@ _CONFIGURED = False
 
 LOG_FORMAT = "%(asctime)s | %(levelname)-7s | %(trace_id)s | %(name)s | %(message)s"
 
+#: 需要借用本项目 handler 的第三方 logger。
+#:
+#: 本模块只给 ``qmt_trade`` 命名空间挂 handler，而第三方库（APScheduler 等）的记录
+#: 一路传播到**真正的根 logger**——那里一个 handler 都没有，于是只有 WARNING+ 经
+#: ``logging.lastResort`` 裸打到 stderr：没有时间戳、没有级别、没有来源，混在
+#: backend.log 里既看不出发生在什么时候，也归不到具体任务上（调度器的
+#: "maximum number of running instances reached" 就是典型）。这里让它们复用同一批
+#: handler，并关掉向根传播，格式与 qmt_trade 日志一致且不会重复输出。
+THIRD_PARTY_LOGGERS: tuple[str, ...] = ("apscheduler",)
+
 
 class _TraceFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
@@ -73,12 +83,13 @@ def setup_logging(
     root.propagate = False
     formatter = logging.Formatter(LOG_FORMAT)
     trace_filter = _TraceFilter()
+    handlers: list[logging.Handler] = []
 
     if console:
         sh = logging.StreamHandler(sys.stdout)
         sh.setFormatter(formatter)
         sh.addFilter(trace_filter)
-        root.addHandler(sh)
+        handlers.append(sh)
 
     if log_dir is not None:
         d = Path(log_dir)
@@ -88,7 +99,7 @@ def setup_logging(
         )
         fh.setFormatter(formatter)
         fh.addFilter(trace_filter)
-        root.addHandler(fh)
+        handlers.append(fh)
 
         eh = TimedRotatingFileHandler(
             d / "error.log", when="midnight", backupCount=60, encoding="utf-8"
@@ -96,7 +107,20 @@ def setup_logging(
         eh.setLevel(logging.ERROR)
         eh.setFormatter(formatter)
         eh.addFilter(trace_filter)
-        root.addHandler(eh)
+        handlers.append(eh)
+
+    for handler in handlers:
+        root.addHandler(handler)
+
+    # 第三方库的记录同样落到这批 handler（详见 THIRD_PARTY_LOGGERS 注释）
+    for name in THIRD_PARTY_LOGGERS:
+        tp = logging.getLogger(name)
+        for handler in list(tp.handlers):
+            tp.removeHandler(handler)
+        for handler in handlers:
+            tp.addHandler(handler)
+        tp.setLevel(logging.WARNING)     # 它们的 DEBUG/INFO 是内部噪音，只留告警
+        tp.propagate = False
 
     _CONFIGURED = True
     return root

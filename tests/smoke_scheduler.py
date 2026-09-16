@@ -17,18 +17,22 @@
 """
 
 from __future__ import annotations
+import atexit
 import logging
+import shutil
 
 import sys
 import tempfile
 from datetime import date, timedelta
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 from qmt_trade.app import (                                      # noqa: E402
     KILL_STATE_KEY, ContextError, TradingContext, build_context as _real_build_context,
 )
+from qmt_trade.core.config import Settings                      # noqa: E402
 from qmt_trade.risk.killswitch import KillMode                   # noqa: E402
 from qmt_trade.scheduler import (                                # noqa: E402
 
@@ -38,9 +42,48 @@ from qmt_trade.scheduler import (                                # noqa: E402
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(message)s")
 logger = logging.getLogger(__name__)
 
+
+def _isolated_settings() -> Settings:
+    """加载**不碰 DuckDB** 的配置，并在模块级接管全局 ``get_settings()``。
+
+    两层原因，缺一不可：
+
+    1. ``Settings.load()`` 只在传入路径**等于** ``config/settings.yaml`` 时才去合并
+       已发布配置（``read_active("settings", ...)``），而那一步要打开
+       ``data/db/qmt.duckdb``。该库单进程独占，实盘后端常年持锁 → PermissionError。
+       把 YAML 拷到临时目录再加载即可跳过，解析路径完全相同。
+    2. ``TradingScheduler.reload()`` 与 ``JobRunner._beat()`` 都是**函数内惰性导入**
+       ``from ..core.config import get_settings``，光给 ``build_context`` 传 settings
+       拦不住它们。所以这里直接替换模块属性（惰性导入取的就是替换后的值），
+       无需 lru_cache 清缓存。
+
+    ``data_dir`` 也必须一起改指临时目录：``DuckDBStore.__init__`` 会走
+    ``Database(runtime_path(root.parent))``，而 ``runtime_path`` 落到的仍是
+    ``data/db/qmt.duckdb`` 这同一个库文件——只换 settings 路径不换 data_dir，
+    构造 DataHub 时照样 PermissionError。
+    """
+    workdir = Path(tempfile.mkdtemp(prefix="qmt_sched_smoke_"))
+    atexit.register(shutil.rmtree, workdir, True)
+    target = workdir / "settings.yaml"
+    shutil.copy2(ROOT / "config" / "settings.yaml", target)
+    st = Settings.load(target)
+    st.set("app.data_dir", str(workdir / "data"))
+
+    import qmt_trade.core.config as cfg
+    cfg.get_settings = lambda: st
+    return st
+
+
+SETTINGS = _isolated_settings()
+
+
 def build_context(mode="paper", **kwargs):
     from qmt_trade.datahub.providers.mock import MockProvider
     from qmt_trade.ops.notify import Notifier, MemoryChannel
+    # 不能用 setdefault：cli.py 走的是 build_context(mode, settings=None, ...)，
+    # 显式传了 None，setdefault 会原样放过 → TradingContext 回落 get_settings() 撞锁。
+    if kwargs.get("settings") is None:
+        kwargs["settings"] = SETTINGS
     kwargs.setdefault("providers", [MockProvider(n_symbols=30)])
     kwargs.setdefault("notifier", Notifier(channels=[MemoryChannel()]))
     context = _real_build_context(mode, **kwargs)

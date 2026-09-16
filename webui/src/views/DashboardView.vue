@@ -7,7 +7,7 @@ import api from "@/api";
 import { useApp } from "@/store";
 import { tryReq, pushToast } from "@/toast";
 import {
-  JOB_KIND, KILL_MODE, LEVEL, MODE, RUN_STATUS, TRADE_ACTION, cn, cnTitle,
+  JOB_KIND, JOB_STATE, KILL_ACTION, KILL_MODE, LEVEL, MODE, RUN_STATUS, TRADE_ACTION, cn, cnTitle,
 } from "@/labels";
 import Modal from "@/components/Modal.vue";
 
@@ -122,8 +122,8 @@ async function doEvolve() {
 
 // ---------- 系统管理 ----------
 async function kill(action: string) {
-  if (action !== "reset" && !confirm(`确认执行 ${action}？该操作会立即改变系统交易状态。`)) return;
-  const r = await tryReq(() => api.setKillswitch(app.mode, action), `总开关已 ${action}`);
+  if (action !== "reset" && !confirm(`确认「${cn(KILL_ACTION, action)}」？该操作会立即改变系统交易状态。`)) return;
+  const r = await tryReq(() => api.setKillswitch(app.mode, action), `总开关已${cn(KILL_ACTION, action)}`);
   if (r) { ov.value = { ...ov.value, killswitch: r }; load(); }
 }
 
@@ -165,35 +165,133 @@ function fmtSeconds(s?: number) {
   return s >= 60 ? `${Math.round(s / 60)} 分钟` : `${s} 秒`;
 }
 
+// ---- 启用状态：人工开关 AND 绑定策略门禁（见 server/routers/overview.py /scheduler/jobs）----
+// 以 enabled 为准而不是 status 字符串：后端老版本没有 status 字段时，
+// enabled 也是 undefined，两者都判为「启用」，表格不会误灰、按钮不会误禁。
+function isJobOff(j: any) {
+  return j?.enabled === false;
+}
+
+// 三态徽标配色：running 绿 / paused 橙（用户自己拨的，就地就能开回来）/ disabled 灰（策略门禁）
+function jobStateClass(j: any) {
+  if (j?.status === "paused") return "warn";
+  return isJobOff(j) ? "muted" : "ok";
+}
+
+// 只有策略门禁未通过才禁「立即运行」—— 那才是用户抱怨的空跑。
+// 人工暂停不禁：暂停管的是"别按日程自动触发"，手动补跑一次是合理逃生口，
+// 否则用户得先开状态、保存、跑一次、再关状态、再保存。
+// jobs.py::_beat 已按 job_enabled 门禁，补跑不会给停用任务写回心跳（不会误判失联拉闸）。
+function canRunNow(j: any) {
+  return j?.strategy_gate !== false;
+}
+
+function runBtnTitle(j: any) {
+  if (!canRunNow(j)) return jobOffHint(j);
+  if (j?.status === "paused") return "任务已手动暂停：这里只补跑一次，不会恢复日程";
+  return "立刻跑一次该任务";
+}
+
+// 停用的任务已从调度器日程上摘除，不会触发；说明去哪儿打开
+function jobStrategyNames(j: any) {
+  return (j?.bound_strategies || []).join("、");
+}
+
+function jobOffHint(j: any) {
+  const sids = jobStrategyNames(j);
+  return sids
+    ? `绑定策略 ${sids} 均未启用，任务已从日程摘除；去「策略实验室」开启后自动恢复`
+    : "任务已停用，不会按日程触发";
+}
+
+// 编辑弹窗的状态说明：先讲清这道开关管什么，再点明另一道闸门（策略门禁）的实情 ——
+// 否则用户把它拨到「启用」、保存、看表格还是灰的，会以为没保存上而反复点。
+const jobEditStateHint = computed(() => {
+  const j = jobEdit.value;
+  if (!j) return "";
+  if (j.strategy_gate === false) {
+    return `绑定策略 ${jobStrategyNames(j)} 均未启用，任务不会挂上日程；`
+      + "这道开关拨到「启用」也只是待命，需去「策略实验室」开启策略后才真正生效";
+  }
+  return j.editEnabled
+    ? "按下面的执行计划自动触发，并正常上报心跳"
+    : "已手动暂停：不按日程触发、不上报心跳；「立即运行」仍可手动补跑一次";
+});
+
+function jobStateTitle(j: any) {
+  const base = cnTitle(JOB_STATE, j.status);
+  const detail = j.status_detail ? String(j.status_detail) : "";
+  if (!isJobOff(j)) return detail ? `${base}｜${detail}` : base;
+  // 恢复路径取决于哪道闸门关着：人工暂停 → 就地开回来；策略门禁 → 去策略实验室。
+  // 两道都关时两条都得说，否则用户开了状态开关发现还是灰的，会以为保存没生效。
+  const paths: string[] = [];
+  if (j.manual_enabled === false) paths.push("在「编辑」里打开状态开关即可恢复");
+  if (j.strategy_gate === false) paths.push(jobOffHint(j));
+  const tail = paths.length ? paths.join("；") : jobOffHint(j);
+  return detail ? `${base}｜${detail}（${tail}）` : `${base}｜${tail}`;
+}
+
 function openJobEdit(j: any) {
   const pad = (n: number) => String(n).padStart(2, "0");
-  jobEdit.value = {
-    ...j,
+  const seed = {
     editTime: `${pad(j.hour || 0)}:${pad(j.minute || 0)}`,
     editWeekday: j.day_of_week ?? 6,
     editSeconds: j.seconds ?? 3,
     editStart: j.start || "09:30",
     editEnd: j.end || "15:00",
+    // 状态开关只反映人工开关那半边（strategy_gate 归「策略实验室」管）；
+    // 后端没给字段时按启用处理，与表格 isJobOff 的兜底一致。
+    editEnabled: j.manual_enabled !== false,
   };
+  // origin 存的是「刚打开弹窗时」的编辑值快照：保存时逐项比对，只提交真改过的字段。
+  // 不能拿 j.start 之类直接比 —— 后端可能返回 null，而 seed 已兜底成 "09:30"，会误判为改动。
+  jobEdit.value = { ...j, ...seed, origin: { ...seed } };
 }
 
 async function saveJobTime() {
   const j = jobEdit.value;
   if (!j) return;
-  jobSaving.value = true;
+  const o = j.origin;
   const body: any = { name: j.name };
-  if (j.kind === "interval") {
-    body.interval_seconds = Number(j.editSeconds);
-    body.start = j.editStart;
-    body.end = j.editEnd;
-  } else {
-    body.time = j.editTime;
-    if (j.name === "evolve") body.day_of_week = Number(j.editWeekday);
+  const touched: string[] = [];
+  // 只提交真拨过的开关：否则每次改时刻都会把 <name>_enabled 无谓写进 settings.yaml
+  if (j.editEnabled !== o.editEnabled) {
+    body.enabled = !!j.editEnabled;
+    touched.push("状态");
   }
+  if (j.kind === "interval") {
+    const secs = Number(j.editSeconds);
+    if (!(secs >= 1 && secs <= 3600)) {
+      pushToast("巡检间隔须在 1~3600 秒之间", "err");
+      return;
+    }
+    if (secs !== Number(o.editSeconds)) { body.interval_seconds = secs; touched.push("巡检间隔"); }
+    if (j.editStart !== o.editStart) { body.start = j.editStart; touched.push("窗口开始"); }
+    if (j.editEnd !== o.editEnd) { body.end = j.editEnd; touched.push("窗口结束"); }
+    if (body.start && body.end && body.start >= body.end) {
+      pushToast(`执行窗口非法：开始 ${body.start} 不早于结束 ${body.end}`, "err");
+      return;
+    }
+  } else {
+    if (j.editTime !== o.editTime) { body.time = j.editTime; touched.push("执行时刻"); }
+    if (j.name === "evolve" && Number(j.editWeekday) !== Number(o.editWeekday)) {
+      body.day_of_week = Number(j.editWeekday);
+      touched.push("执行日");
+    }
+  }
+  if (!touched.length) { pushToast("没有需要保存的改动", "info"); return; }
+
+  jobSaving.value = true;
   const r = await tryReq(() => api.schedulerUpdateJob(body));
   jobSaving.value = false;
   if (r) {
-    pushToast(`「${j.name}」调度已更新（${r.hint || "已生效"}）`, "ok");
+    pushToast(`「${j.name}」${touched.join("、")}已更新（${r.hint || "已生效"}）`, "ok");
+    // 人工开关拨到「启用」但绑定策略仍全关 → 任务照样不跑。回传里带了落盘后的
+    // 真实生效状态，必须当场说清楚，否则用户看表格还是灰的会以为保存失败。
+    if (r.enabled === false && r.strategy_gate === false) {
+      pushToast(`绑定策略 ${jobStrategyNames(j)} 仍未启用，任务不会挂上日程；`
+        + "去「策略实验室」开启后自动恢复", "info");
+    }
     jobEdit.value = null;
     load();
   }
@@ -236,6 +334,11 @@ const healthIssue = computed(() => {
   if (reasons.length) return reasons.join("；");
   return health.value?.killswitch?.reason || "";
 });
+// 调度器实际账本模式与当前页面 mode 不一致 → 「UI 看 live、自动交易跑 paper」错位告警
+const schedModeMismatch = computed(() => {
+  const sm = ov.value?.scheduler_mode;
+  return !!sm && sm !== app.mode;
+});
 
 onMounted(load);
 watch(() => app.mode, load);
@@ -268,6 +371,11 @@ watch(() => app.mode, load);
             <span class="badge sm" :class="ov?.llm_enabled ? 'ok' : 'muted'">
               {{ ov?.llm_enabled ? "已启用" : "未启用" }}
             </span>
+          </div>
+          <div class="tiny ds-sub" :class="schedModeMismatch ? 'warn' : 'muted'"
+               :title="'常驻调度器（自动交易 / ETF T+0）实际运行的账本模式，由 settings.yaml 的 scheduler.mode 决定'">
+            自动交易：{{ cn(MODE, ov?.scheduler_mode) || "未知" }}
+            <span v-if="schedModeMismatch">⚠️ 与当前页面不一致</span>
           </div>
         </div>
       </div>
@@ -358,11 +466,11 @@ watch(() => app.mode, load);
 
     <!-- Kill Switch -->
     <div class="card">
-      <h3>🛡️ 交易总开关（Kill Switch）<span class="sub">失败安全：异常时自动降级为 REDUCE_ONLY</span></h3>
+      <h3>🛡️ 交易总开关<span class="sub">失败安全：异常时自动降级为「只减不加」</span></h3>
       <div class="row">
-        <button class="btn warn" @click="kill('engage')">降级 REDUCE_ONLY</button>
-        <button class="btn danger" @click="kill('flatten')">强制平仓 FLATTEN</button>
-        <button class="btn ghost" @click="kill('reset')">恢复 NORMAL</button>
+        <button class="btn warn" @click="kill('engage')">降级为只减不加</button>
+        <button class="btn danger" @click="kill('flatten')">强制清仓</button>
+        <button class="btn ghost" @click="kill('reset')">恢复正常</button>
         <div class="spacer"></div>
         <button class="btn ghost" @click="load">刷新</button>
       </div>
@@ -405,12 +513,18 @@ watch(() => app.mode, load);
     </div>
 
     <div class="card">
-      <h3>📅 调度任务 <span class="sub">自动按日程执行，点「编辑」可调整执行时刻，保存后立即生效</span></h3>
+      <h3>📅 调度任务
+        <span class="sub">
+          自动按日程执行，点「编辑」可调整执行时刻或手动启停，保存后立即生效；
+          策略专属任务还跟随「策略实验室」里的策略开关联动，任一道闸门关闭时任务直接从日程上摘除（不空跑）
+        </span>
+      </h3>
       <table>
         <thead>
           <tr>
             <th style="width:130px">任务</th>
             <th style="width:80px">类型</th>
+            <th style="width:88px">状态</th>
             <th style="width:180px">执行计划</th>
             <th style="width:200px">下次执行</th>
             <th>用途说明</th>
@@ -418,11 +532,16 @@ watch(() => app.mode, load);
           </tr>
         </thead>
         <tbody>
-          <tr v-for="j in sched?.jobs || []" :key="j.name">
+          <tr v-for="j in sched?.jobs || []" :key="j.name" :class="{ 'row-off': isJobOff(j) }">
             <td><b class="pill">{{ j.name }}</b></td>
             <td>
               <span class="badge sm" :class="j.kind === 'interval' ? 'info' : ''">
                 {{ cn(JOB_KIND, j.kind) }}
+              </span>
+            </td>
+            <td>
+              <span class="badge sm" :class="jobStateClass(j)" :title="jobStateTitle(j)">
+                {{ cn(JOB_STATE, j.status) }}
               </span>
             </td>
             <td>
@@ -431,14 +550,15 @@ watch(() => app.mode, load);
                 {{ j.cron }}
               </span>
             </td>
-            <td class="tiny">{{ fmtNextRun(j.next_run) }}</td>
+            <td class="tiny">{{ isJobOff(j) ? "—" : fmtNextRun(j.next_run) }}</td>
             <td class="tiny muted">{{ j.description || "—" }}</td>
             <td>
               <button class="btn sm ghost" @click="openJobEdit(j)">编辑</button>
-              <button class="btn sm" @click="runJob(j.name)">立即运行</button>
+              <button class="btn sm" :disabled="!canRunNow(j)" :title="runBtnTitle(j)"
+                      @click="runJob(j.name)">立即运行</button>
             </td>
           </tr>
-          <tr v-if="!(sched?.jobs || []).length"><td colspan="6" class="muted">暂无数据</td></tr>
+          <tr v-if="!(sched?.jobs || []).length"><td colspan="7" class="muted">暂无数据</td></tr>
         </tbody>
       </table>
     </div>
@@ -471,6 +591,11 @@ watch(() => app.mode, load);
 
     <Modal v-if="jobEdit" :title="`编辑调度任务 · ${jobEdit.name}`" @close="jobEdit = null">
       <p class="tiny muted" style="margin-top:0">{{ jobEdit.description }}</p>
+      <div class="field">
+        <label><input type="checkbox" v-model="jobEdit.editEnabled" style="width:auto" />
+          <b>{{ jobEdit.editEnabled ? "启用" : "手动暂停" }}</b>（按日程自动触发）</label>
+        <div class="tiny" :class="jobEdit.editEnabled ? 'muted' : 'note-warn'">{{ jobEditStateHint }}</div>
+      </div>
       <template v-if="jobEdit.kind === 'interval'">
         <div class="field">
           <label>巡检间隔（秒，1~3600）</label>
@@ -498,7 +623,7 @@ watch(() => app.mode, load);
           <input v-model="jobEdit.editTime" type="time" />
         </div>
       </template>
-      <p class="tiny muted">保存后写入 config/settings.yaml（scheduler.jobs），常驻调度器立即按新时刻生效。</p>
+      <p class="tiny muted">保存后写入 config/settings.yaml（scheduler.jobs），常驻调度器立即按新的执行计划与状态生效。</p>
       <template #actions>
         <button class="btn ghost" @click="jobEdit = null">取消</button>
         <button :disabled="jobSaving" @click="saveJobTime">{{ jobSaving ? "保存中…" : "保存" }}</button>
@@ -574,4 +699,8 @@ watch(() => app.mode, load);
 }
 .badge.sm { font-size: 11px; padding: 1px 6px; }
 .sched-label { font-weight: 600; margin-right: 6px; }
+/* 停用的调度任务整行淡出，与「运行中」形成一眼可辨的层次 */
+.row-off > td { opacity: 0.55; }
+/* 编辑弹窗里「手动暂停」的提示用告警色，跟表格 paused 徽标同色系 */
+.note-warn { color: var(--warn); line-height: 1.5; }
 </style>

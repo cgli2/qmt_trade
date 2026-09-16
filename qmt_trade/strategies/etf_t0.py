@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as dtime
 from typing import Any
@@ -67,6 +68,16 @@ def _parse_t(text: str) -> dtime:
         return dtime(int(h), int(m))
     except Exception:                                # noqa: BLE001
         return dtime(0, 0)
+
+
+#: 拒因里的实时数字（风险预算/止损距离/取整股数）逐笔都不同，直接计数会每条一个 key。
+#: 归一化：把数字串折成 '#'，让同类拒因聚合成一条，summary 才读得懂。
+_NUM_RE = re.compile(r"\d+(?:\.\d+)?")
+
+
+def _normalize_reject(reason: str) -> str:
+    """把拒因中的数字折成 '#'，用于 base_reject_reasons 聚合计数。"""
+    return _NUM_RE.sub("#", (reason or "未知"))[:160]
 
 
 def mom_sell_ok(cfg: ETFT0Config, mom: float, sym: str | None = None) -> bool:
@@ -720,7 +731,7 @@ class ETFT0LiveRunner:
         state = self._load_state()
         summary = {"skipped": False, "symbols": 0, "legs_opened": 0,
                    "legs_closed": 0, "fills": 0, "rejected": 0,
-                   "forced_flat": False, "base": 0}
+                   "forced_flat": False, "base": 0, "base_reject_reasons": {}}
 
         for sym in cfg.symbols:
             bars = self._minute_bars(sym)
@@ -748,7 +759,7 @@ class ETFT0LiveRunner:
                                         "blocked": False, "trades_today": 0,
                                         "last_trade_time": "", "base_done": False})
             # ---- 底仓：无持仓时在开腿窗口内按 base_fraction 建仓，建仓当日不做T ----
-            if self._ensure_base(sym, price, tv, st, cfg):
+            if self._ensure_base(sym, price, tv, st, cfg, summary):
                 summary["fills"] += 1
                 summary["base"] += 1
                 continue
@@ -792,8 +803,16 @@ class ETFT0LiveRunner:
 
     # ------------------------------------------------------------ 底仓
     def _ensure_base(self, sym: str, price: float, tv, st: dict,
-                     cfg: ETFT0Config) -> bool:
-        """无持仓时按 base_fraction 建底仓（每个标的一次）。返回是否已成交。"""
+                     cfg: ETFT0Config, summary: dict | None = None) -> bool:
+        """无持仓时按 base_fraction 建底仓（每个标的一次）。返回是否已成交。
+
+        失败路径此前静默 ``return False``（summary 里 rejected=0），底仓被
+        KillSwitch / Regime 上限 / sizer 取整拦下时日志完全看不出原因
+        （2026-09-15 事故：DB 里 695 笔 ETF_T0_BASE 全拒，summary 却显示
+        rejected=0）。这里补 ``logger.warning`` + 把拒因透传进 summary 的
+        ``rejected`` 计数与 ``base_reject_reasons`` 聚合，只恢复可观测性，
+        不改任何交易逻辑。
+        """
         pos = self.ctx.portfolio.positions.get(sym)
         if pos is not None and pos.shares > 0:
             st["base_done"] = True
@@ -809,6 +828,20 @@ class ETFT0LiveRunner:
         if res is not None and res.ok and res.fill is not None:
             st["base_done"] = True
             return True
+        # ---- 建仓被拒：如实记录（区分「无行情」与「风控/网关/sizer 拒单」）----
+        if res is None:
+            reason = "无行情_bar（_submit 返回 None）"
+        elif res.rejected_by:
+            reason = f"{res.rejected_by}: {res.reason}"
+        else:
+            reason = res.reason or "未知（ok=False 且无 rejected_by）"
+        logger.warning("ETF T+0 %s 底仓建仓被拒 %s @%.3f :: %s",
+                       self.jr.today, sym, price, reason)
+        if summary is not None:
+            summary["rejected"] += 1
+            rr = summary.setdefault("base_reject_reasons", {})
+            key = _normalize_reject(reason)
+            rr[key] = rr.get(key, 0) + 1
         return False
 
     # ------------------------------------------------------------ 腿操作

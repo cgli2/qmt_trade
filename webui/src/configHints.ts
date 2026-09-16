@@ -40,6 +40,9 @@ export const CONFIG_HINTS: Record<string, string> = {
   "datahub.cache.max_items": "内存缓存最多保留多少条数据",
   "datahub.quality.max_missing_ratio": "K 线缺失比例超过该值时判定数据质量不合格",
   "datahub.quality.max_abs_return": "单根 K 线涨跌幅绝对值超过该值视为异常数据（剔除或告警）",
+  "datahub.quality.new_listing_grace_days":
+    "上市多少天内算新股期：新股无常规涨跌幅限制，这段区间的大跳变只提示不判脏数据，0=关闭豁免",
+  "datahub.quality.warn_interval": "同类数据质量告警的最短重复间隔（秒），防止热路径每 30 秒刷屏",
 
   // ============ features 因子打分 ============
   "features.weights.mom_20d": "20 日动量因子权重：近一个月涨得多得分高",

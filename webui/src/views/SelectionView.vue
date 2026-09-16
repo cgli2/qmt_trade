@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {
-  AGENT, CONVICTION, STANCE, TRADE_ACTION, VERDICT,
+  AGENT, CONVICTION, FACTOR, STANCE, TRADE_ACTION, VERDICT,
 } from "@/labels";
 
 const ACTION_LABEL = TRADE_ACTION;
@@ -257,26 +257,11 @@ function convictionClass(v: string) {
 const CONVICTION_LABEL = CONVICTION;
 
 // ---------- 投票可读化翻译 ----------
+// 因子字典复用 labels.ts 的 FACTOR（全项目唯一来源）；另补 regime 相关词，
+// 因为失效表达式(invalidation_checks)里会直接写市况码（如 regime==RISK_OFF）。
 const FACTOR_CN: Record<string, string> = {
-  close_price: "最新收盘价", close: "最新收盘价", price: "最新收盘价", entry: "买入价",
-  high_60d: "60日最高价", score_percentile: "综合分全市场分位",
-  ma_bullish_score: "均线多头排列分", ma_align: "均线多头排列分",
-  ep_ratio: "盈利收益率", earnings_yield: "盈利收益率",
-  debt_safety_score: "偿债安全分", debt_safety: "偿债安全分",
-  missing_fields_count: "数据缺失字段数", days_between: "间隔天数",
+  ...FACTOR,
   regime: "市场状态", RISK_OFF: "避险状态", TREND_DOWN: "下行趋势", TREND_UP: "上行趋势",
-  revenue_yoy: "营收同比", profit_yoy: "净利同比", net_profit_yoy: "净利同比",
-  roe: "ROE", gross_margin: "毛利率", turnover_rate: "换手率",
-  ret_20d: "20日涨跌幅", ret_60d: "60日涨跌幅", bias_20: "20日乖离率",
-  atr_ratio: "ATR占价比", downside_vol: "下行波动率", max_drawdown_60: "60日最大回撤",
-  breakout_60: "距60日高点比", close_ratio_60d_high: "价格相对60日高点比",
-  distance_from_60d_high: "距60日高点距离",
-  main_net_5d: "近5日主力净流入", main_net_10d: "近10日主力净流入",
-  main_net_ratio: "主力净流入占成交比", large_order_ratio: "大单占比",
-  flow_consistency: "资金流一致性", news_sentiment_5d: "近5日新闻情绪",
-  news_heat_5d: "近5日新闻热度", event_sentiment_20d: "近20日事件情绪",
-  industry_momentum: "行业动量",
-  hard_negative_event: "严重负面事件", hard_negative_flag: "严重负面事件标记",
 };
 const _FACTOR_RE: [RegExp, string][] = Object.keys(FACTOR_CN)
   .sort((a, b) => b.length - a.length)
@@ -460,7 +445,7 @@ watch(() => app.mode, () => { loadStrategies(); loadWatchlist(); loadFinal(); lo
                 <button class="fc-symbol" @click="goMarket(p.symbol)" :title="'查看 ' + p.symbol + ' 行情'">
                   {{ p.symbol }}
                 </button>
-                <span v-if="p.industry" class="tiny muted">{{ p.industry }}</span>
+                <span v-if="pickLabel(p)" class="tiny muted">{{ pickLabel(p) }}</span>
                 <span class="badge" :class="actionClass(p.action)">{{ ACTION_LABEL[p.action] || p.action }}</span>
                 <span class="badge" :class="convictionClass(p.conviction)">{{ CONVICTION_LABEL[p.conviction] || p.conviction }}</span>
                 <span class="tiny muted" v-if="p.confidence != null">置信 {{ fmtConf(p.confidence) }}</span>

@@ -22,6 +22,11 @@ const start = ref(defaultStartFor("D1"));
 const end = ref("");
 const adjust = ref<"QFQ" | "HFQ" | "NONE">("QFQ"); // 前复权(默认,最新价≈真实):后复权:不复权
 const bars = ref<any[]>([]);
+// K线明细表分页：默认只渲染最近 N 行。原先 400 行 × 8 列一次性同步渲染，且模板里每行调
+// rowChg() 三次（:style 一次、文本插值两次）+ 每次渲染新建 bars.slice().reverse() 数组，
+// 是切股瞬间主线程被长时间占住、图表与页面"卡一下"的另一半原因。
+const DETAIL_PAGE = 60;
+const detailLimit = ref(DETAIL_PAGE);
 const quote = ref<any>(null);
 const news = ref<any[]>([]);
 const tab = ref<"bars" | "quote" | "news">("bars");
@@ -98,13 +103,84 @@ async function loadPicks() {
   picksNote.value = r?.note || "";
 }
 
-async function loadKline() {
+// ---------------- K线取数：结果缓存 + 并发去重 + 竞态守卫（卡顿修复 2026-09-16）
+// 原实现三缺：① 每次切股都重新请求，回看刚看过的标的也要重等一轮；② 同一 key 连点会
+// 并发发出多份完全相同的请求；③ 响应不带序号，快速切股时先发的请求可能后到，把 bars
+// 覆盖成**别的标的**的数据（图表与明细表随之整体重绘，观感就是"卡一下还显示错了"）。
+// 另外 loading 原先绑在根 div，而全局 .loading{opacity:.55;pointer-events:none} 会让
+// **整页变暗且不可点击** —— 加载期间连点「策略推荐」卡片毫无反应，这是"明显卡顿"的直接来源。
+const KLINE_CACHE_MS = 60_000;   // 与后端 minute_bar_ttl 同量级：盘中当日 bar 会变，不宜久存
+const KLINE_CACHE_MAX = 40;      // 上限防长期驻留膨胀（一条 400 行日线约 100KB）
+const klineCache = new Map<string, { at: number; rows: any[] }>();
+const klineInflight = new Map<string, Promise<any[] | undefined>>();
+let klineSeq = 0;                // 单调递增请求序号：只接受最后一次点击的结果
+const klineLoading = ref(false); // 局部 loading：只罩 K线区，绝不锁左栏与整页
+
+function klineKey(sym: string) {
+  return [sym, period.value, start.value, end.value || "", adjust.value, app.mode].join("|");
+}
+
+function klineCachePut(key: string, rows: any[]) {
+  if (klineCache.size >= KLINE_CACHE_MAX) {
+    // Map 的迭代序即插入序；命中时 loadKline 会 delete+set 把该项移到末尾，
+    // 因此首键就是最久未使用的一条 —— 删它即标准 LRU，零依赖。
+    const oldest = klineCache.keys().next().value;
+    if (oldest !== undefined) klineCache.delete(oldest);
+  }
+  klineCache.set(key, { at: Date.now(), rows });
+}
+
+async function fetchKline(key: string, sym: string): Promise<any[] | undefined> {
+  // 并发去重：同 key 的重复点击共享同一个在途 Promise，后端只挨一次
+  const pending = klineInflight.get(key);
+  if (pending) return pending;
+  const p = (async () => {
+    const r = await tryReq(() => api.kline(
+      sym, period.value, start.value, app.mode, end.value || undefined, 400, adjust.value));
+    if (!r) return undefined;              // 失败不入缓存，下次点击可立即重试
+    const rows = r.rows || [];
+    klineCachePut(key, rows);
+    return rows;
+  })();
+  klineInflight.set(key, p);
+  try {
+    return await p;
+  } finally {
+    klineInflight.delete(key);
+  }
+}
+
+/** @param force 跳过结果缓存（「查询」按钮 / 改复权方式时用，保证拿到最新数据） */
+async function loadKline(force = false) {
   if (!picked.value) { pushToast("请先选择标的", "err"); return; }
-  loading.value = true;
-  const r = await tryReq(() => api.kline(picked.value, period.value, start.value, app.mode, end.value || undefined, 400, adjust.value));
-  bars.value = r?.rows || [];
-  loading.value = false;
-  if (r && !bars.value.length) pushToast("该区间无数据，试试放宽日期", "info");
+  const sym = picked.value;
+  const key = klineKey(sym);
+  const seq = ++klineSeq;
+  if (!force) {
+    const hit = klineCache.get(key);
+    if (hit && Date.now() - hit.at < KLINE_CACHE_MS) {
+      // 只调整**淘汰顺序**（删后重插 → 移到 Map 末尾），保留原始取数时刻 hit.at。
+      // 若走 klineCachePut 会用 Date.now() 重置 at，反复点击同一标的等于无限续期 TTL，
+      // 盘中当日 bar 将永远刷不出来。
+      klineCache.delete(key);
+      klineCache.set(key, hit);
+      bars.value = hit.rows;
+      detailLimit.value = DETAIL_PAGE;     // 换标的后明细表回到第一页
+      return;                              // 秒开：零请求、零等待、零 loading 闪烁
+    }
+  }
+  klineLoading.value = true;
+  try {
+    const rows = await fetchKline(key, sym);
+    // 竞态守卫：期间用户已切到别的标的 → 丢弃本次结果，绝不覆盖当前 bars
+    if (seq !== klineSeq || picked.value !== sym) return;
+    if (rows === undefined) return;        // tryReq 已弹过错误 toast
+    bars.value = rows;
+    detailLimit.value = DETAIL_PAGE;
+    if (!rows.length) pushToast("该区间无数据，试试放宽日期", "info");
+  } finally {
+    if (seq === klineSeq) klineLoading.value = false;
+  }
 }
 
 function switchPeriod(p: "D1" | "W1" | "M1" | "Y1") {
@@ -255,14 +331,33 @@ function switchTab(t: any) {
   if (t === "news" && !news.value.length) loadNews();
 }
 
-// K线明细表：相对前一根的涨跌幅（%）
-function rowChg(idx: number) {
+// K线明细表：倒序 + 涨跌幅 + 格式化**一次算好**并缓存为 computed。
+// 模板里因此变成纯字段读取：零函数调用、零数组新建、零重复 Number() 转换，
+// 且只有 bars / detailLimit 变化时才重算（原先每次任意重渲染都会全表重算）。
+const detailRows = computed(() => {
   const rows = bars.value;
-  if (idx <= 0 || !rows[idx - 1]) return null;
-  const prev = Number(rows[idx - 1].close), cur = Number(rows[idx].close);
-  if (!prev) return null;
-  return ((cur - prev) / prev) * 100;
-}
+  const from = Math.max(rows.length - detailLimit.value, 0);
+  const out: any[] = [];
+  for (let i = rows.length - 1; i >= from; i--) {
+    const b = rows[i];
+    const prevClose = i > 0 ? Number(rows[i - 1].close) : 0;
+    const chg = prevClose ? ((Number(b.close) - prevClose) / prevClose) * 100 : null;
+    out.push({
+      key: String(b.date).slice(0, 10),
+      open: Number(b.open).toFixed(2),
+      high: Number(b.high).toFixed(2),
+      low: Number(b.low).toFixed(2),
+      close: Number(b.close).toFixed(2),
+      chgText: chg == null ? "-" : chg.toFixed(2) + "%",
+      up: (chg ?? 0) >= 0,
+      vol: Number(b.volume).toLocaleString(),
+      amount: b.amount ? Number(b.amount).toLocaleString() : "-",
+    });
+  }
+  return out;
+});
+const detailHidden = computed(() => bars.value.length - detailRows.value.length);
+function showAllDetail() { detailLimit.value = bars.value.length; }
 
 const stats = computed(() => {
   if (!bars.value.length) return null;
@@ -278,17 +373,18 @@ const stats = computed(() => {
 });
 
 async function reload() {
-  await loadSymbols();
-  await loadPicks();
   // 深链 ?sym= 直达（如从选股研判页点击个股跳转）
   const qs = String(route.query.sym || "");
   if (qs && qs !== picked.value) picked.value = qs;
+  // 标的已知就立刻发 K线请求，不必等 /market/symbols（实测 ~1.5s）返回才开始画图；
+  // symbols 与 picks 之间也互不依赖，原先串行 await 纯属白等
+  const klineTask = picked.value ? loadKline() : Promise.resolve();
+  await Promise.all([loadSymbols(), loadPicks()]);
+  await klineTask;
   if (!picked.value) {
     // 预选优先：策略推荐第一只 > 全市场第一只
     const pref = picks.value[0]?.symbol || symbols.value[0]?.symbol;
     if (pref) { picked.value = pref; loadKline(); }
-  } else {
-    loadKline();
   }
 }
 
@@ -306,7 +402,7 @@ watch([pageTab, tab, picked], () => {
 </script>
 
 <template>
-  <div :class="{ loading }">
+  <div>
     <!-- 页级 tab：行情与事件融合 -->
     <div class="page-tabs">
       <button class="page-tab" :class="{ on: pageTab === 'market' }" @click="pageTab = 'market'">📈 行情查询</button>
@@ -314,7 +410,9 @@ watch([pageTab, tab, picked], () => {
     </div>
 
     <div v-if="pageTab === 'market'" class="market-layout">
-      <!-- 左栏：策略推荐 + 全部标的搜索 -->
+      <!-- 左栏：策略推荐 + 全部标的搜索。
+           ★ 刻意**不**受 loading 影响：全局 .loading 带 pointer-events:none，
+             若绑在根节点会让加载期间整页（含本栏）不可点击，用户连点卡片毫无反应。 -->
       <aside class="m-side">
         <section class="card picks-card">
           <div class="picks-head">
@@ -362,8 +460,8 @@ watch([pageTab, tab, picked], () => {
         </section>
       </aside>
 
-      <!-- 右栏：行情详情 -->
-      <main class="m-main">
+      <!-- 右栏：行情详情。loading（新闻/实时行情）只罩本栏，不锁左栏与页级 tab -->
+      <main class="m-main" :class="{ loading }">
         <div class="card">
           <h3>📈 行情查询
             <span class="sub">与回测/实盘同一条 DataHub 取数路径（PIT 保证，P7）</span>
@@ -379,13 +477,19 @@ watch([pageTab, tab, picked], () => {
             <div><label>结束日期</label><input v-model="end" type="date" /></div>
             <div>
               <label>复权方式</label>
-              <select v-model="adjust" @change="loadKline">
+              <!-- 显式传 true：Vue 会把 Event 对象当首个实参传入，
+                   依赖"Event 恰好真值"来跳过缓存太脆弱 -->
+              <select v-model="adjust" @change="loadKline(true)">
                 <option value="QFQ">前复权（最新价≈真实）</option>
                 <option value="HFQ">后复权</option>
                 <option value="NONE">不复权</option>
               </select>
             </div>
-            <div style="flex:0 0 auto"><label>&nbsp;</label><button @click="loadKline">查询</button></div>
+            <div style="flex:0 0 auto"><label>&nbsp;</label>
+              <button :disabled="klineLoading" @click="loadKline(true)">
+                {{ klineLoading ? "加载中…" : "查询" }}
+              </button>
+            </div>
           </div>
           <div style="margin-top:12px; display:flex; gap:6px">
             <button class="btn sm" :class="tab === 'bars' ? '' : 'ghost'" @click="switchTab('bars')">K线</button>
@@ -405,7 +509,7 @@ watch([pageTab, tab, picked], () => {
             <div class="stat"><div class="label">K线根数</div><div class="value pill">{{ stats.count }}</div></div>
           </div>
 
-          <div class="card">
+          <div class="card kline-card">
             <div class="kline-head">
               <h3>K线图 <span class="sub">{{ picked }} · {{ periodLabel }}</span></h3>
               <div class="period-group">
@@ -432,29 +536,38 @@ watch([pageTab, tab, picked], () => {
             </div>
             <KlineChart :rows="bars" :mas="maVisible" :period="period" style="height:440px" />
             <div class="tiny muted" style="margin-top:6px">滚轮缩放 · 拖拽平移 · 双击复位 · 悬停查看明细</div>
+            <!-- 局部加载指示：只浮在 K线卡片上，且自身 pointer-events:none，
+                 加载期间用户仍能继续点左栏切股、也能缩放图表（原整页 loading 做不到） -->
+            <div v-if="klineLoading" class="kline-busy">
+              <span class="spin"></span>正在加载 {{ picked }} 的{{ periodLabel }}…
+            </div>
           </div>
 
           <div class="card">
-            <h3>K线明细 <span class="sub">{{ bars.length }} 行</span></h3>
+            <h3>K线明细 <span class="sub">
+              共 {{ bars.length }} 行<template v-if="detailHidden > 0"> · 已显示最近 {{ detailRows.length }} 行</template>
+            </span></h3>
             <div style="max-height:460px; overflow:auto">
               <table>
                 <thead><tr><th>日期</th><th>开</th><th>高</th><th>低</th><th>收</th><th>涨跌幅</th><th>成交量</th><th>成交额</th></tr></thead>
                 <tbody>
-                  <tr v-for="(b, i) in bars.slice().reverse()" :key="i">
-                    <td class="pill">{{ String(b.date).slice(0, 10) }}</td>
-                    <td class="pill">{{ Number(b.open).toFixed(2) }}</td>
-                    <td class="pill">{{ Number(b.high).toFixed(2) }}</td>
-                    <td class="pill">{{ Number(b.low).toFixed(2) }}</td>
-                    <td class="pill"><b>{{ Number(b.close).toFixed(2) }}</b></td>
-                    <td class="pill" :style="{ color: (rowChg(bars.length - 1 - i) ?? 0) >= 0 ? 'var(--danger)' : 'var(--ok)' }">
-                      {{ rowChg(bars.length - 1 - i) == null ? "-" : rowChg(bars.length - 1 - i)!.toFixed(2) + "%" }}
-                    </td>
-                    <td class="pill tiny">{{ Number(b.volume).toLocaleString() }}</td>
-                    <td class="pill tiny">{{ b.amount ? Number(b.amount).toLocaleString() : "-" }}</td>
+                  <!-- 纯字段读取：涨跌幅/格式化已在 detailRows computed 里一次算好 -->
+                  <tr v-for="r in detailRows" :key="r.key">
+                    <td class="pill">{{ r.key }}</td>
+                    <td class="pill">{{ r.open }}</td>
+                    <td class="pill">{{ r.high }}</td>
+                    <td class="pill">{{ r.low }}</td>
+                    <td class="pill"><b>{{ r.close }}</b></td>
+                    <td class="pill" :style="{ color: r.up ? 'var(--danger)' : 'var(--ok)' }">{{ r.chgText }}</td>
+                    <td class="pill tiny">{{ r.vol }}</td>
+                    <td class="pill tiny">{{ r.amount }}</td>
                   </tr>
                   <tr v-if="!bars.length"><td colspan="8" class="muted">无数据</td></tr>
                 </tbody>
               </table>
+            </div>
+            <div v-if="detailHidden > 0" style="padding-top:10px; text-align:center">
+              <button class="btn sm ghost" @click="showAllDetail">显示全部 {{ bars.length }} 行</button>
             </div>
           </div>
         </template>
@@ -648,6 +761,37 @@ watch([pageTab, tab, picked], () => {
   margin-bottom: 10px;
 }
 .kline-head h3 { margin: 0; }
+/* 局部加载指示：浮在图表上方，自身不拦截鼠标 → 加载中仍可切股/缩放/平移 */
+.kline-card { position: relative; }
+.kline-busy {
+  position: absolute;
+  top: 54px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-elev);
+  color: var(--text-2);
+  font-size: 12px;
+  white-space: nowrap;
+  box-shadow: var(--shadow-sm);
+  pointer-events: none;
+  z-index: 3;
+}
+.spin {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 12px;
+  border: 2px solid var(--border);
+  border-top-color: var(--primary);
+  border-radius: 50%;
+  animation: kline-spin 0.7s linear infinite;
+}
+@keyframes kline-spin { to { transform: rotate(360deg); } }
 .period-group {
   display: flex;
   gap: 4px;

@@ -3,6 +3,7 @@
 import { computed, onMounted, ref } from "vue";
 import api from "@/api";
 import { tryReq } from "@/toast";
+import { cn, cnTitle, translateText, LESSON_TAG } from "@/labels";
 
 const reports = ref<any[]>([]);
 const kind = ref(""); // "" = 全部
@@ -55,6 +56,11 @@ function fmtSize(n: number) {
   return n >= 1024 ? (n / 1024).toFixed(1) + " KB" : n + " B";
 }
 
+// 记忆面板是纯文本渲染：先就地翻译英文码，再去掉后端夹带的 Markdown 反引号，避免字面显示 `。
+function memo(s: unknown): string {
+  return translateText(s).replace(/`/g, "");
+}
+
 // ---------- 轻量 Markdown → HTML（先转义再渲染，无第三方依赖） ----------
 function esc(s: string) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -105,7 +111,7 @@ function mdToHtml(md: string) {
   closeTable(); closeList();
   return out.join("\n");
 }
-const html = computed(() => mdToHtml(content.value));
+const html = computed(() => mdToHtml(translateText(content.value)));
 
 async function loadMemory() {
   loadingMem.value = true;
@@ -136,7 +142,7 @@ onMounted(() => {
             <span class="sub" v-if="memory.short_term.date">{{ memory.short_term.date }}</span>
           </div>
           <ul v-if="memory.short_term.items.length" class="mem-list">
-            <li v-for="(x, i) in memory.short_term.items" :key="i">{{ x }}</li>
+            <li v-for="(x, i) in memory.short_term.items" :key="i">{{ memo(x) }}</li>
           </ul>
           <div v-else class="muted tiny">暂无（盘后复盘自动生成）</div>
         </div>
@@ -147,8 +153,8 @@ onMounted(() => {
           </div>
           <ul v-if="memory.long_term.length" class="mem-list">
             <li v-for="(m, i) in memory.long_term.slice(0, 10)" :key="i">
-              <span class="mem-tag" v-if="m.tag">{{ m.tag }}</span>
-              {{ m.text }}
+              <span class="mem-tag" v-if="m.tag" :title="cnTitle(LESSON_TAG, m.tag)">{{ cn(LESSON_TAG, m.tag) }}</span>
+              {{ memo(m.text) }}
               <span class="mem-occ" v-if="m.occurrences > 1">×{{ m.occurrences }}</span>
             </li>
           </ul>

@@ -4,7 +4,10 @@
 运行：python tests/smoke_datahub.py
 """
 from __future__ import annotations
+import atexit
 import logging
+import shutil
+import tempfile
 
 import sys
 from datetime import date, datetime
@@ -13,7 +16,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from qmt_trade.core.config import get_settings  # noqa: E402
+from qmt_trade.core.config import Settings  # noqa: E402
 from qmt_trade.core.errors import DataUnavailableError, LookAheadError  # noqa: E402
 from qmt_trade.datahub.manager import DataHub  # noqa: E402
 from qmt_trade.datahub.pit import PITGuard, assert_no_lookahead  # noqa: E402
@@ -35,6 +38,27 @@ def check(name: str, cond: bool, extra: str = "") -> None:
     else:
         FAIL += 1
         logger.info(f"  [FAIL] {name} {extra}")
+
+
+def _isolated_settings() -> Settings:
+    """加载**不碰 DuckDB、不写共享 data 目录**的配置。
+
+    直接 ``get_settings()`` 有两个问题，都会让本 smoke 在实盘后端运行时炸掉：
+
+    1. ``Settings.load()`` 只在传入路径**等于** ``config/settings.yaml`` 时才去合并
+       已发布配置（config.py 的 ``read_active("settings", ...)``），而那一步要打开
+       ``data/db/qmt.duckdb``。该库是单进程独占，后端常年持锁 → PermissionError。
+       把 YAML 拷到临时目录再加载，走的仍是同一条解析路径，只是跳过已发布配置的合并。
+    2. ``settings.data_dir`` 决定 ``DuckDBStore`` 与 ``bars_cache`` 的落盘位置，
+       指向真实 ``data/`` 会与后端并发写同一批文件。这里改指一次性临时目录。
+    """
+    workdir = Path(tempfile.mkdtemp(prefix="smoke_datahub_"))
+    atexit.register(shutil.rmtree, workdir, True)
+    target = workdir / "settings.yaml"
+    shutil.copy2(ROOT / "config" / "settings.yaml", target)
+    st = Settings.load(target)
+    st.set("app.data_dir", str(workdir / "data"))
+    return st
 
 
 class BrokenProvider(DataProvider):
@@ -60,7 +84,7 @@ class BrokenProvider(DataProvider):
 
 
 def main() -> int:
-    st = get_settings()
+    st = _isolated_settings()
     st.set("datahub.priority.bars", ["broken", "mock"])
     st.set("datahub.priority.instruments", ["mock"])
     st.set("datahub.circuit_breaker.fail_threshold", 2)

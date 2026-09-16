@@ -124,6 +124,14 @@ LITERAL_MAP: list[tuple[str, str, str, str]] = [
      r"^Status = Literal\[[^\]]*\]", "POOL_STATUS"),
     ("确信度", "qmt_trade/brain/schemas.py",
      r"conviction: Literal\[[^\]]*\]", "CONVICTION"),
+    # 调度任务状态：抓 runner.py 里的单行常量 JOB_STATES，而不是在下面 FIXED_SETS
+    # 再抄一份 —— 抄的那份不会随后端新增状态自动更新，漏一个就是 UI 上直接露出
+    # 英文码。也别去抓 JobSpec.status 的属性体：docstring 里的三引号会把正则带偏，
+    # 抓出来是垃圾值（实测过）。runner.py 导入期已有 JOB_STATES ↔ _JOB_STATE_MARKS
+    # 一致性守卫，常量就是唯一来源。正则匹配失败时 literal_values 会直接
+    # SystemExit，宁可报错也不静默放过。
+    ("调度任务状态", "qmt_trade/scheduler/runner.py",
+     r"^JOB_STATES: tuple\[str, \.\.\.\] = \([^)]*\)", "JOB_STATE"),
 ]
 
 # 纯字面量约定（源码里无集中定义，按实际写入值固定）

@@ -140,6 +140,26 @@ class HealthMonitor:
             except Exception:                       # noqa: BLE001
                 pass
 
+    def forget(self, component: str) -> None:
+        """注销一个组件的心跳（内存 + 库），与 :meth:`heartbeat` 严格互逆。
+
+        组件被停用（如定时任务随策略开关从日程上摘除）后**必须**调用：库里残留的
+        ``hb:<component>`` 会被 ``_check_heartbeats`` 当作仍在编的活组件，超过阈值
+        没跳就判"失联"→ ERROR（blocking）→ 自动降级 REDUCE_ONLY，把"停用一个策略"
+        放大成"全系统禁止开仓"。删除的库与 heartbeat 写入的库保持同一选择规则。
+        """
+        self._beats.pop(component, None)
+        repo = None
+        if component.startswith("job:") and self.shared_repos is not None:
+            repo = self.shared_repos.system
+        elif self.repos is not None:
+            repo = self.repos.system
+        if repo is not None:
+            try:
+                repo.delete(f"hb:{component}")
+            except Exception:                       # noqa: BLE001
+                pass
+
     def register(self, name: str, fn: Callable[[], CheckResult]) -> None:
         """挂自定义检查项。"""
         self._custom.append((name, fn))

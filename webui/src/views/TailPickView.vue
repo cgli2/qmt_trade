@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import {
-  MODE, ORDER_STATUS, SIDE, cn, cnTitle,
+  KILL_MODE, MODE, ORDER_STATUS, SIDE, cn, cnTitle,
 } from "@/labels";
 // 尾盘选股法（一夜持股法）独立控制面板。
 // 完全独立于现有多因子选股/Regime/风控体系：只读/写 strategies.tail_pick
@@ -214,7 +214,7 @@ async function save() {
 async function runOnce(name: "tail_pick_select" | "tail_pick_exit") {
   const label = name === "tail_pick_select" ? "尾盘选股" : "隔夜离场";
   const tip = name === "tail_pick_select"
-    ? "将立即执行尾盘选股；若策略已启用且非 sim 模式、KillSwitch 为 NORMAL，会真实提交模拟买入。确定执行？"
+    ? "将立即执行尾盘选股；若策略已启用且非 sim 模式、交易总开关为「正常」，会真实提交模拟买入。确定执行？"
     : "将立即对昨日尾盘买入的持仓提交离场卖出。确定执行？";
   if (!window.confirm(tip)) return;
   loading.value = true;
@@ -297,8 +297,8 @@ watch(() => app.mode, load);
 
       <div class="tp-bar">
         <div class="tp-item">
-          <span class="tp-label">KillSwitch</span>
-          <span class="badge" :class="ksBadge">{{ st?.killswitch?.mode || "-" }}</span>
+          <span class="tp-label">交易总开关</span>
+          <span class="badge" :class="ksBadge" :title="cnTitle(KILL_MODE, st?.killswitch?.mode)">{{ cn(KILL_MODE, st?.killswitch?.mode) }}</span>
           <span class="tiny muted">{{ st?.killswitch?.allow_open ? "允许开仓" : "只出不进" }}</span>
         </div>
         <div class="tp-item" v-for="j in (st?.schedule || [])" :key="j.name">
@@ -319,7 +319,7 @@ watch(() => app.mode, load);
       </div>
       <p class="tiny muted" style="margin-top:10px;margin-bottom:0;line-height:1.6">
         独立性说明：本策略自带 8 层筛选器与仓位/止损纪律，不走现有 SelectionPipeline / Regime / RiskEngine；
-        执行与现有系统共用同一套撮合/成本口径。KillSwitch 非 NORMAL 时买入被自动拦截，离场不受影响。
+        执行与现有系统共用同一套撮合/成本口径。交易总开关非「正常」时买入被自动拦截，离场不受影响。
         sim 模式只做机制验证（不真实下单），模拟盘请切到 <b>paper</b>。
       </p>
     </div>

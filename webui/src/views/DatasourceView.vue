@@ -88,7 +88,7 @@ watch(() => app.mode, load);
           </tbody>
         </table>
         <div class="tiny muted" style="margin-top:8px">
-          连续失败达阈值即打开熔断，冷却后半开试探；全部源熔断时取数抛错，触发 REDUCE_ONLY 失败安全（P4）。
+          连续失败达阈值即打开熔断，冷却后半开试探；全部源熔断时取数抛错，触发「只减不加」失败安全（P4）。
         </div>
       </div>
 

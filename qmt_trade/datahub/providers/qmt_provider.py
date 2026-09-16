@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Sequence
@@ -21,6 +22,41 @@ from ..types import (Adjust, Freq, Fundamental, InstrumentInfo, SourceSkipped, T
 from .base import Capability, DataProvider
 
 logger = get_logger("datahub.qmt")
+
+# ── xtdata native 调用进程级串行锁 ──────────────────────────────────────────
+# xtquant.xtdata 维持单一进程级 native 连接（127.0.0.1:58610）。后端多线程
+# （research 后台 io 工作线程 + market.py 同步端点所在的 anyio 线程池）并发进入
+# 其 C 扩展（get_market_data_ex / download_history_data / get_full_tick /
+# subscribe_quote ...）会触发无 Python traceback 的段错误，直接杀死整个进程
+# （2026-09-16 实测：POST /selection/research 返回 200 后 17s 内后端硬崩，
+# 隔离单线程跑同一路径则不崩）。native 连接是进程级资源，故用模块级 RLock 把
+# 所有 xtdata 调用串行化；RLock 允许同线程嵌套（_safe_market_data → _reconnect）。
+#
+# 超时安全阀：download_financial_data2 / download_history_data2 已知可能长阻塞
+# （内部 while is_connected(): sleep）。若持锁线程卡死会 wedge 掉所有 QMT 访问
+# （回归 _run_in_thread 守护线程 + 硬超时所欲避免的整夜卡死）。故 acquire 带超时：
+# 等待超过 _XTDATA_LOCK_TIMEOUT 仍拿不到锁，则记 warning 后在无锁下执行，
+# 用「牺牲一次串行保护」换取「绝不永久 wedge」。默认 120s 远大于崩溃面的短/中
+# 调用（get_market_data_ex/get_full_tick/download_history_data 单次均 <10s），
+# 只在真正卡死时才触发安全阀。可用环境变量 QMT_LOCK_TIMEOUT 覆盖。
+_XTDATA_LOCK = threading.RLock()
+_XTDATA_LOCK_TIMEOUT = float(os.environ.get("QMT_LOCK_TIMEOUT", "120"))
+
+
+@contextmanager
+def _xt_serialized(label: str):
+    """进程级串行进入 xtdata native 调用；带超时安全阀，杜绝永久 wedge。"""
+    got = _XTDATA_LOCK.acquire(timeout=_XTDATA_LOCK_TIMEOUT)
+    if not got:
+        logger.warning(
+            "QMT native 串行锁等待超时(%ss)，%s 无锁执行（疑似有 native 调用卡死）",
+            _XTDATA_LOCK_TIMEOUT, label)
+    try:
+        yield
+    finally:
+        if got:
+            _XTDATA_LOCK.release()
+
 
 #: 项目根目录（qmt_trade/datahub/providers/ → 上溯 3 级），用于定位默认磁盘缓存目录。
 _PROJ_ROOT = Path(__file__).resolve().parents[3]
@@ -126,7 +162,8 @@ class QmtProvider(DataProvider):
             if key in self._subscribed:
                 continue
             try:
-                self.xtdata.subscribe_quote(s, period=period)
+                with _xt_serialized("subscribe_quote"):
+                    self.xtdata.subscribe_quote(s, period=period)
                 self._subscribed.add(key)
             except Exception as exc:  # noqa: BLE001 - 订阅失败不应击穿取数链
                 logger.warning("QMT 订阅 %s(%s) 失败: %s", s, period, exc)
@@ -149,7 +186,8 @@ class QmtProvider(DataProvider):
         try:
             connect = getattr(self.xtdata, "connect", None)
             if callable(connect):
-                connect()
+                with _xt_serialized("connect"):
+                    connect()
                 logger.info("QMT 行情连接已重新建立（connect()）")
         except Exception as exc:  # noqa: BLE001
             logger.debug("QMT 重连尝试失败（仍按原路径失败）: %s", exc)
@@ -162,9 +200,10 @@ class QmtProvider(DataProvider):
         field_list = ["time", "open", "high", "low", "close", "volume", "amount", "preClose"]
         for attempt in range(2):
             try:
-                return self.xtdata.get_market_data_ex(
-                    field_list=field_list, stock_list=syms, period=period,
-                    start_time=s, end_time=e, dividend_type=_ADJUST_MAP[adjust], fill_data=False)
+                with _xt_serialized("get_market_data_ex"):
+                    return self.xtdata.get_market_data_ex(
+                        field_list=field_list, stock_list=syms, period=period,
+                        start_time=s, end_time=e, dividend_type=_ADJUST_MAP[adjust], fill_data=False)
             except Exception as exc:  # noqa: BLE001 - 10054 等连接重置
                 logger.warning("QMT get_market_data_ex 第 %d 次失败: %s", attempt + 1, exc)
                 if attempt == 0:
@@ -205,7 +244,8 @@ class QmtProvider(DataProvider):
     def _cancel_download(self) -> None:
         """取消可能仍在后台流式拉取的 QMT 下载请求。"""
         try:
-            self.xtdata.get_client().stop_supply_history_data2()
+            with _xt_serialized("stop_supply_history_data2"):
+                self.xtdata.get_client().stop_supply_history_data2()
         except Exception:  # noqa: BLE001
             pass
 
@@ -236,8 +276,9 @@ class QmtProvider(DataProvider):
             if now - self._last_dl.get(key, 0.0) < _INTRADAY_DL_INTERVAL:
                 continue
             try:
-                self.xtdata.download_history_data(sym, period,
-                                                    start_time=today_s, end_time=today_s)
+                with _xt_serialized("download_history_data(intraday)"):
+                    self.xtdata.download_history_data(sym, period,
+                                                        start_time=today_s, end_time=today_s)
             except Exception as exc:  # noqa: BLE001 - 下载失败仍按本地存量降级
                 logger.warning("QMT 盘中分钟数据增量下载失败 %s: %s", sym, exc)
             self._last_dl[key] = now
@@ -285,7 +326,8 @@ class QmtProvider(DataProvider):
         if missing:
             for sym in missing:
                 try:
-                    self.xtdata.download_history_data(sym, period, start_time=s, end_time=e)
+                    with _xt_serialized("download_history_data(bars)"):
+                        self.xtdata.download_history_data(sym, period, start_time=s, end_time=e)
                 except Exception as exc:  # noqa: BLE001 - 下载失败交给降级链
                     logger.warning("QMT 下载历史数据失败 %s: %s", sym, exc)
             raw = self._safe_market_data(syms, period, s, e, adjust)
@@ -330,7 +372,8 @@ class QmtProvider(DataProvider):
         syms = [normalize_symbol(s) for s in symbols]
         try:
             self.subscribe(syms)
-            raw = self.xtdata.get_full_tick(syms) or {}
+            with _xt_serialized("get_full_tick"):
+                raw = self.xtdata.get_full_tick(syms) or {}
         except Exception as exc:               # noqa: BLE001 - 订阅/取数异常不应击穿调度链
             logger.warning("QMT 实时行情获取失败: %s", exc)
             return {}
@@ -480,14 +523,16 @@ class QmtProvider(DataProvider):
 
         def worker() -> dict[str, dict] | None:
             try:
-                self.xtdata.download_financial_data2(
-                    syms, tables, s, e, lambda d: self._on_progress("财务", d))
+                with _xt_serialized("download_financial_data2"):
+                    self.xtdata.download_financial_data2(
+                        syms, tables, s, e, lambda d: self._on_progress("财务", d))
             except Exception as exc:  # noqa: BLE001
                 logger.warning("QMT 财务下载请求发起失败（仍尝试读本地缓存）: %s", exc)
             deadline = time.monotonic() + eff_timeout
             while time.monotonic() < deadline:
                 try:
-                    raw = self.xtdata.get_financial_data(syms, tables, s, e, "announce_time")
+                    with _xt_serialized("get_financial_data"):
+                        raw = self.xtdata.get_financial_data(syms, tables, s, e, "announce_time")
                 except Exception:  # noqa: BLE001
                     raw = {}
                 if self._financial_has_data(raw, tables):
@@ -597,10 +642,12 @@ class QmtProvider(DataProvider):
     def get_instruments(self, symbols: Sequence[str] | None = None) -> list[InstrumentInfo]:
         syms = [normalize_symbol(s) for s in (symbols or [])]
         if not syms:
-            syms = list(self.xtdata.get_stock_list_in_sector("沪深A股") or [])
+            with _xt_serialized("get_stock_list_in_sector"):
+                syms = list(self.xtdata.get_stock_list_in_sector("沪深A股") or [])
         out: list[InstrumentInfo] = []
         for sym in syms:
-            detail = self.xtdata.get_instrument_detail(sym) or {}
+            with _xt_serialized("get_instrument_detail"):
+                detail = self.xtdata.get_instrument_detail(sym) or {}
             name = str(detail.get("InstrumentName", ""))
             open_date = str(detail.get("OpenDate", "") or "")
             list_date = None
@@ -650,18 +697,20 @@ class QmtProvider(DataProvider):
             # download_history_data2 内部有阻塞等待循环 → 必须在守护线程里跑，
             # 超时由 _run_in_thread 兜住；这里再轮询本地落地确保读到数据。
             try:
-                self.xtdata.download_history_data2(
-                    syms, "transactioncount1d", s, e, lambda d: self._on_progress("资金流", d))
+                with _xt_serialized("download_history_data2(moneyflow)"):
+                    self.xtdata.download_history_data2(
+                        syms, "transactioncount1d", s, e, lambda d: self._on_progress("资金流", d))
             except Exception as exc:  # noqa: BLE001
                 logger.warning("QMT 资金流下载请求失败: %s", exc)
                 return None
             deadline = time.monotonic() + self._dl_timeout
             while time.monotonic() < deadline:
                 try:
-                    raw = self.xtdata.get_market_data_ex(
-                        field_list=[], stock_list=syms, period="transactioncount1d",
-                        start_time=s, end_time=e, dividend_type="none", fill_data=False,
-                    )
+                    with _xt_serialized("get_market_data_ex(moneyflow)"):
+                        raw = self.xtdata.get_market_data_ex(
+                            field_list=[], stock_list=syms, period="transactioncount1d",
+                            start_time=s, end_time=e, dividend_type="none", fill_data=False,
+                        )
                 except Exception:  # noqa: BLE001
                     raw = {}
                 if raw and any(df is not None and len(df) for df in raw.values()):

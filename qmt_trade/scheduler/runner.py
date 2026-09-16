@@ -6,6 +6,16 @@
    内置的轮询循环（精度秒级，够用）。调度器本身不该成为系统起不来的理由。
 2. **盘中不是 cron 而是 interval**。09:30–15:00 每 N 秒巡检一次持仓，
    cron 表达不了"区间内高频"，用 interval + 时段判断更直白。
+
+另有一条贯穿全模块的联动规则：**任务是否挂上日程 = 人工开关 AND 绑定策略门禁**。
+
+- 人工开关：``scheduler.jobs.<name>_enabled``（默认 true），工作台「编辑调度任务」
+  里的状态开关直接写它，见 :func:`manual_enabled`；
+- 策略门禁：绑定关系见 ``JOB_STRATEGY_BINDING``，判定见 :func:`bound_strategy_enabled`；
+- 合成判定见 :func:`job_enabled`。
+
+任一不通过，任务连 job 都不注册（而不是注册后每次触发再 return skipped），从根上
+消掉空跑开销。
 """
 
 from __future__ import annotations
@@ -44,6 +54,116 @@ JOB_DESCRIPTIONS: dict[str, str] = {
 _DOW = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 _DOW_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
+#: 任务 ↔ 独立策略绑定：绑定的策略**任一** ``strategies.<sid>.enabled=true`` 时任务才挂上日程。
+#: 未登记的任务属于主管线（data_sync/regime/…/intraday/reconcile/review/evolve），恒启用——
+#: 它们是系统骨架，不随任何单个策略开关起停。
+#:
+#: 为什么是"摘掉 job"而不是"job 内部 return skipped"：interval 任务交易日每 30 秒触发一次
+#: （660 次/天），每次都要打心跳、抢 ``_strategy_boundary_lock``、跑一遍
+#: ``StrategyRepository.apply_at_boundary`` 再打一行 SKIP 日志——策略没开时这些全是纯开销。
+JOB_STRATEGY_BINDING: dict[str, tuple[str, ...]] = {
+    "etf_t0_intraday": ("etf_t0",),
+    "stock_t0_intraday": ("stock_t0",),
+    "tail_pick_select": ("tail_pick",),
+    "tail_pick_exit": ("tail_pick",),
+    # open 相位只有打板/二板真下买单（低吸/趋势在尾盘 run 相位买）
+    "strategylab_open": ("limit_up", "second_board"),
+    # run 相位 = 尾盘买入（低吸/趋势）+ 四个策略的持仓管理 + 日收益入策略池
+    "strategylab_run": ("limit_up", "second_board", "dip_buy", "trend_buy"),
+}
+
+#: cron 型任务名 → ``scheduler.jobs`` 下存"执行时刻"的键。
+#: 任务名与配置键并非总是一致（``research`` 的历史键名是 ``llm_research``），
+#: 编辑路由据此校验任务名并落盘，避免白名单在前后端各写一份后漂移。
+JOB_TIME_KEYS: dict[str, str] = {
+    "data_sync": "data_sync",
+    "regime": "regime",
+    "selection": "selection",
+    "research": "llm_research",
+    "plan": "plan",
+    "auction_check": "auction_check",
+    "reconcile": "reconcile",
+    "review": "review",
+    "evolve": "evolve",
+    "tail_pick_select": "tail_pick_select",
+    "tail_pick_exit": "tail_pick_exit",
+    "strategylab_open": "strategylab_open",
+    "strategylab_run": "strategylab_run",
+}
+
+#: interval 型任务名 → (窗口开始键, 窗口结束键, 间隔秒键)，同在 ``scheduler.jobs`` 下。
+JOB_WINDOW_KEYS: dict[str, tuple[str, str, str]] = {
+    "intraday": ("intraday_start", "intraday_end", "intraday_interval_seconds"),
+    "etf_t0_intraday": ("etf_t0_start", "etf_t0_end", "etf_t0_interval_seconds"),
+    "stock_t0_intraday": ("stock_t0_start", "stock_t0_end", "stock_t0_interval_seconds"),
+}
+
+#: interval 型任务的兜底周期（秒）。配置缺失时 ``_build_specs`` 与
+#: :func:`job_interval_seconds` 必须取同一个值，否则触发器周期与"等锁预算"会
+#: 各算各的——预算比真实周期还长时，一次调用就会跨到下轮触发。
+JOB_INTERVAL_DEFAULTS: dict[str, int] = {
+    "intraday": 3,
+    "etf_t0_intraday": 30,
+    "stock_t0_intraday": 30,
+}
+
+
+def job_interval_seconds(name: str, settings) -> int:
+    """任务自身的触发周期（秒）。非 interval 型（cron）或计划表外 → ``0``。
+
+    给 ``jobs.py`` 推导抢策略边界锁的等待预算用：预算必须**明显小于自身周期**，
+    否则"等锁 + 干活"会跨到下轮触发，APScheduler 又要刷"实例数已达上限"。
+    """
+    keys = JOB_WINDOW_KEYS.get(name)
+    if not keys:
+        return 0
+    default = JOB_INTERVAL_DEFAULTS.get(name, 30)
+    if settings is None:
+        return default
+    try:
+        return max(1, int(settings.get(f"scheduler.jobs.{keys[2]}", default)))
+    except Exception:                                # noqa: BLE001
+        return default
+
+
+def bound_strategy_enabled(name: str, settings) -> bool:
+    """策略门禁：无策略绑定 → 恒 True；有绑定 → 任一策略启用即 True。
+
+    只看策略开关，不看人工开关；要判"任务到底跑不跑"请用 :func:`job_enabled`。
+    """
+    sids = JOB_STRATEGY_BINDING.get(name)
+    if not sids or settings is None:
+        return True
+    for sid in sids:
+        try:
+            if bool(settings.get(f"strategies.{sid}.enabled", False)):
+                return True
+        except Exception:                            # noqa: BLE001
+            continue
+    return False
+
+
+def manual_enabled(name: str, settings) -> bool:
+    """工作台里的人工开关：``scheduler.jobs.<name>_enabled``，缺省视为开。
+
+    与策略门禁是 **AND** 关系 —— 人工关掉就不挂日程；策略没开时人工开着也不挂。
+    配置读不出来时一律回落到"开"：漏跑一个任务比多跑一个更容易被发现。
+    """
+    if settings is None:
+        return True
+    try:
+        return bool(settings.get(f"scheduler.jobs.{name}_enabled", True))
+    except Exception:                                # noqa: BLE001
+        return True
+
+
+def job_enabled(name: str, settings) -> bool:
+    """任务是否该挂上日程 = 人工开关 AND 绑定策略门禁。
+
+    这是**唯一**该被外部（jobs 的心跳门禁、路由校验）引用的判定入口。
+    """
+    return manual_enabled(name, settings) and bound_strategy_enabled(name, settings)
+
 
 def _parse_hm(text: str, default: tuple[int, int]) -> tuple[int, int]:
     try:
@@ -52,6 +172,27 @@ def _parse_hm(text: str, default: tuple[int, int]) -> tuple[int, int]:
     except Exception:                                # noqa: BLE001
         logger.warning("时间格式非法 %r，改用 %02d:%02d", text, *default)
         return default
+
+
+#: 调度任务状态码全集 —— ``JobSpec.status`` 的取值域，也是前端 ``labels.ts`` 里
+#: ``JOB_STATE`` 字典必须覆盖的键。i18n 校验脚本直接从这一行抓取值（见
+#: ``tests/check_i18n_enum_coverage.py`` 的 LITERAL_MAP），所以新增状态时改这里
+#: 就等于同时给校验脚本下了新指标：labels.ts 没补中文译文，校验立刻失败。
+JOB_STATES: tuple[str, ...] = ("running", "paused", "disabled")
+
+#: 状态码 → ``describe()`` 里的标记后缀（纯文本计划表的"停用"提示）。
+_JOB_STATE_MARKS: dict[str, str] = {
+    "running": "",
+    "paused": "  [人工暂停]",
+    "disabled": "  [停用]",
+}
+
+# 两张表必须同步：漏一个状态，describe() 会在拼计划表时 KeyError。放在导入期炸，
+# 比等到调度器启动、或用户点开工作台页面才炸要好定位得多。
+_missing = set(JOB_STATES) ^ set(_JOB_STATE_MARKS)
+if _missing:
+    raise RuntimeError(f"JOB_STATES 与 _JOB_STATE_MARKS 不一致，差异：{sorted(_missing)}")
+del _missing
 
 
 @dataclass
@@ -66,6 +207,14 @@ class JobSpec:
     start_time: dtime | None = None
     end_time: dtime | None = None
     description: str = ""
+    #: 人工开关（工作台「编辑调度任务」里的状态开关）；False = 用户主动停用
+    manual_enabled: bool = True
+    #: 绑定策略门禁是否通过（无绑定 → 恒 True）
+    strategy_gate: bool = True
+    #: 生效启用 = manual_enabled AND strategy_gate。False → 调度器不注册该 job
+    enabled: bool = True
+    #: 绑定的独立策略 id（见 JOB_STRATEGY_BINDING）；空 = 主管线任务，不受策略门禁管
+    bound_strategies: tuple[str, ...] = ()
 
     @property
     def time_label(self) -> str:
@@ -94,8 +243,50 @@ class JobSpec:
         dow = "*" if not self.day_of_week else self.day_of_week
         return f"{self.minute} {self.hour} * * {dow}"
 
+    def in_window(self, now: datetime) -> bool:
+        """当前时刻是否落在该计划的巡检窗口内。
+
+        ``start_time``/``end_time`` 只有 interval 型任务会配（如盘中巡检 09:30–15:00）；
+        cron 型任务的时刻由触发器自己表达，恒 True。
+
+        **APScheduler 路径必须显式判这一条**：``IntervalTrigger`` 只认"每 N 秒"，
+        窗口信息传不进去（``start_date``/``end_date`` 是一次性时间点，表达不了每日
+        复现的窗口）。此前只有退化轮询 ``_loop`` 判窗口，于是 30 秒一 tick 的巡检
+        任务在夜里也照触发——每 tick 都要抢策略边界锁、跑一遍
+        ``apply_at_boundary``（DuckDB 写）、再打一行 SKIP，纯烧资源；长任务持锁时
+        还会让三个巡检任务一起排队，APScheduler 随即每 30 秒刷一条
+        "maximum number of running instances reached"。
+        """
+        if self.kind != "interval" or not self.start_time or not self.end_time:
+            return True
+        t = now.time()
+        return self.start_time <= t <= self.end_time
+
+    @property
+    def status(self) -> str:
+        """UI 展示用状态码：running（在跑）/ paused（人工暂停）/ disabled（随策略停用）。
+
+        两道闸门都关时显示 ``paused``：人工开关是用户自己拨的、也在他手边，
+        优先提示这个才有可操作性（策略门禁的原因写进 ``status_detail``）。
+        """
+        if self.enabled:
+            return "running"
+        return "paused" if not self.manual_enabled else "disabled"
+
+    @property
+    def status_detail(self) -> str:
+        """停用原因（启用时为空串）。UI 挂 tooltip，让用户知道去哪儿恢复。"""
+        if self.enabled:
+            return ""
+        reasons = []
+        if not self.manual_enabled:
+            reasons.append("已在工作台手动暂停")
+        if not self.strategy_gate and self.bound_strategies:
+            reasons.append("绑定策略均未启用：" + "、".join(self.bound_strategies))
+        return "；".join(reasons) or "已停用"
+
     def describe(self) -> str:
-        return f"{self.name:<14} {self.kind:<8} {self.time_label}"
+        return f"{self.name:<14} {self.kind:<8} {self.time_label}{_JOB_STATE_MARKS[self.status]}"
 
 
 class TradingScheduler:
@@ -149,37 +340,35 @@ class TradingScheduler:
         eh2, em2 = _parse_hm(c.get("intraday_end", "15:00"), (15, 0))
         specs.append(JobSpec(
             "intraday", "interval",
-            seconds=max(1, int(c.get("intraday_interval_seconds", 3))),
+            seconds=job_interval_seconds("intraday", self.settings),
             start_time=dtime(sh, sm), end_time=dtime(eh2, em2),
             description=JOB_DESCRIPTIONS.get("intraday", "")))
 
-        # ETF T+0（底仓做T）：常挂日程，job 内部按 strategies.etf_t0.enabled
-        # 决定是否真跑（enabled=false 返回 skipped）——WebUI「策略实验室」开关即启停。
+        # ETF T+0（底仓做T）：strategies.etf_t0.enabled=false 时整条计划被摘掉
+        # （不再每 30 秒空跑一遍）——WebUI「策略实验室」开关即启停，改完 reload 生效。
         et0_sh, et0_sm = _parse_hm(c.get("etf_t0_start", "09:30"), (9, 30))
         et0_eh, et0_em = _parse_hm(c.get("etf_t0_end", "15:00"), (15, 0))
         specs.append(JobSpec(
             "etf_t0_intraday", "interval",
-            seconds=max(1, int(c.get("etf_t0_interval_seconds", 30))),
+            seconds=job_interval_seconds("etf_t0_intraday", self.settings),
             start_time=dtime(et0_sh, et0_sm), end_time=dtime(et0_eh, et0_em),
             description=JOB_DESCRIPTIONS.get("etf_t0_intraday", "")))
 
-        # 个股存量持仓做T（高抛低吸，独立策略）：常挂日程，job 内部按
-        # strategies.stock_t0.enabled 决定是否真跑（enabled=false 返回 skipped）。
-        # 只对白名单里的已有持仓做日内先卖后买，不建仓、不净加仓、不净减仓，
-        # 尾盘 T 仓强制归零；与主策略 / ETF T+0 完全独立。
+        # 个股存量持仓做T（高抛低吸，独立策略）：strategies.stock_t0.enabled=false
+        # 时整条计划被摘掉。只对白名单里的已有持仓做日内先卖后买，不建仓、不净加仓、
+        # 不净减仓，尾盘 T 仓强制归零；与主策略 / ETF T+0 完全独立。
         st0_sh, st0_sm = _parse_hm(c.get("stock_t0_start", "09:30"), (9, 30))
         st0_eh, st0_em = _parse_hm(c.get("stock_t0_end", "15:00"), (15, 0))
         specs.append(JobSpec(
             "stock_t0_intraday", "interval",
-            seconds=max(1, int(c.get("stock_t0_interval_seconds", 30))),
+            seconds=job_interval_seconds("stock_t0_intraday", self.settings),
             start_time=dtime(st0_sh, st0_sm), end_time=dtime(st0_eh, st0_em),
             description=JOB_DESCRIPTIONS.get("stock_t0_intraday", "")))
 
-        # 尾盘选股法（独立短线策略）：始终挂在日程上，由 job 内部按
-        # strategies.tail_pick.enabled 决定是否真跑（enabled=false 时返回 skipped）。
+        # 尾盘选股法（独立短线策略）：strategies.tail_pick.enabled=false 时两条计划
+        # 一起摘掉（选股与离场同生同灭，不会只关一半留下裸持仓）。
         # 时刻默认 14:30 / 09:30，可被 scheduler.jobs.tail_pick_select/exit 覆盖；
-        # 改时刻需 reload 调度器（同其他 cron 任务），改 enabled 则下次触发即生效
-        # （job 内部实时读 get_settings）。
+        # 改时刻与改 enabled 都要 reload 调度器（tail_pick 路由已自动 reload）。
         tp_sel = _parse_hm(c.get("tail_pick_select", "14:30"), (14, 30))
         tp_exit = _parse_hm(c.get("tail_pick_exit", "09:30"), (9, 30))
         specs.append(JobSpec("tail_pick_select", "cron", *tp_sel,
@@ -187,22 +376,55 @@ class TradingScheduler:
         specs.append(JobSpec("tail_pick_exit", "cron", *tp_exit,
                              description=JOB_DESCRIPTIONS.get("tail_pick_exit", "")))
 
-        # 策略实验室（独立策略）：同样常挂日程，job 内部按 strategies.<sid>.enabled
-        # 决定跑不跑（enabled=false 返回 skipped）——WebUI「策略实验室」页的启用开关
-        # 即运行/停止开关，勾选后下一次触发即生效（无需重启）。
+        # 策略实验室（独立策略）：open/run 两个相位各绑定一组策略
+        # （见 JOB_STRATEGY_BINDING），组内全关就摘掉对应相位。WebUI「策略实验室」页
+        # 的启用开关即运行/停止开关，保存后路由会 reload 调度器，无需重启。
         slb_open = _parse_hm(c.get("strategylab_open", "09:35"), (9, 35))
         slb_run = _parse_hm(c.get("strategylab_run", "14:45"), (14, 45))
         specs.append(JobSpec("strategylab_open", "cron", *slb_open,
                              description=JOB_DESCRIPTIONS.get("strategylab_open", "")))
         specs.append(JobSpec("strategylab_run", "cron", *slb_run,
                              description=JOB_DESCRIPTIONS.get("strategylab_run", "")))
+        self._publish_intervals(specs)
+        return self._apply_gates(specs)
+
+    def _publish_intervals(self, specs: list[JobSpec]) -> None:
+        """把 interval 型任务的**真实触发周期**挂到 ctx，供 ``jobs.py`` 算等锁预算。
+
+        为什么不让 jobs.py 自己读配置：``jobs_cfg`` 是快照，而预算要到触发那一刻
+        才读。工作台改了周期、调度器还没 reload 时触发器仍是旧周期——预算若按新
+        周期算就可能长过真实周期，一次调用跨到下轮触发，APScheduler 又要刷
+        ``maximum number of running instances``。以 spec 为准才不会错配。
+        """
+        ctx = getattr(getattr(self, "runner", None), "ctx", None)
+        if ctx is None:                                 # 裸构造（测试）时没有 ctx
+            return
+        ctx._job_intervals = {s.name: s.seconds          # noqa: SLF001
+                              for s in specs if s.kind == "interval"}
+
+    def _apply_gates(self, specs: list[JobSpec]) -> list[JobSpec]:
+        """给每条计划打两道闸门标记，合成出最终 ``enabled``。
+
+        - ``manual_enabled``：工作台「编辑调度任务」里的人工开关；
+        - ``strategy_gate``：绑定策略是否有任一启用（见 JOB_STRATEGY_BINDING）。
+
+        specs 始终包含**全部**任务（UI 要展示"哪些被停用了"以及停用原因），
+        真正的过滤发生在注册/触发环节 —— 见 ``_build_apscheduler`` / ``_loop``。
+        """
+        for spec in specs:
+            spec.bound_strategies = JOB_STRATEGY_BINDING.get(spec.name, ())
+            spec.manual_enabled = manual_enabled(spec.name, self.settings)
+            spec.strategy_gate = bound_strategy_enabled(spec.name, self.settings)
+            spec.enabled = spec.manual_enabled and spec.strategy_gate
         return specs
 
     def reload(self) -> bool:
-        """重读配置并重建计划表（Web 页面改了执行时刻后调用）。
+        """重读配置并重建计划表（Web 页面改了执行时刻/状态/策略启停后调用）。
 
-        APScheduler 下逐条换触发器；退化轮询模式下
-        ``_loop`` 每轮遍历 ``self.specs``，整体替换列表即生效。
+        退化轮询模式下 ``_loop`` 每轮遍历 ``self.specs``，整体替换列表即生效；
+        APScheduler 下必须**增删改三管齐下**：改时刻用 reschedule，任务停用要
+        remove_job（否则继续空跑），重新启用要 add_job（reschedule 一个
+        不存在的 job 会抛 JobLookupError，把整轮 reload 拖成失败）。
         """
         from ..core.config import get_settings
         # save_settings 落盘后已失效单例，这里重取才是最新 YAML；
@@ -213,25 +435,71 @@ class TradingScheduler:
             pass
         logger.info("调度计划重载：%s", self.settings.get("scheduler.jobs"))
         self.jobs_cfg = dict(self.settings.section("scheduler").get("jobs", {}) or {})
+        old = {s.name: s for s in self.specs}
         self.specs = self._build_specs()
         self._fired.clear()
-        if self._sched is not None:
-            try:
-                for spec in self.specs:
-                    if spec.kind == "cron":
-                        from apscheduler.triggers.cron import CronTrigger
-                        trigger = CronTrigger(hour=spec.hour, minute=spec.minute,
-                                              day_of_week=spec.day_of_week or "mon-sun",
-                                              timezone=self.timezone)
-                    else:
-                        from apscheduler.triggers.interval import IntervalTrigger
-                        trigger = IntervalTrigger(seconds=spec.seconds,
-                                                  timezone=self.timezone)
-                    self._sched.reschedule_job(spec.name, trigger=trigger)
-            except Exception as exc:                     # noqa: BLE001
-                logger.warning("调度计划热更新失败（重启后端后生效）: %s", exc)
-                return False
+        self._sync_beats()
+        if self._sched is None:
+            return True
+        try:
+            self._sync_apscheduler(old)
+        except Exception as exc:                       # noqa: BLE001
+            logger.warning("调度计划热更新失败（重启后端后生效）: %s", exc)
+            return False
         return True
+
+    def _sync_apscheduler(self, old: dict[str, JobSpec]) -> None:
+        """把 APScheduler 里的 job 集合对齐到 ``self.specs`` 中启用的那部分。"""
+        new = {s.name: s for s in self.specs}
+        for name in set(old) - set(new):             # 计划表里彻底消失的任务
+            self._remove_job(name)
+        for name, spec in new.items():
+            if not spec.enabled:
+                self._remove_job(name, spec.status_detail)
+                continue
+            prev = old.get(name)
+            if prev is not None and prev.enabled:    # 原本就挂着 → 只换触发器
+                self._sched.reschedule_job(name, trigger=self._trigger_of(spec))
+            else:                                    # 新任务 / 刚被重新启用 → 挂上去
+                self._add_job(spec)
+        logger.info("调度计划已对齐：启用 %d 项，停用 %d 项",
+                    sum(1 for s in self.specs if s.enabled),
+                    sum(1 for s in self.specs if not s.enabled))
+
+    def _remove_job(self, name: str, reason: str = "已停用") -> None:
+        """摘除一个 job。本来就不存在（一直没启用过）是正常情况，静默跳过。"""
+        try:
+            from apscheduler.jobstores.base import JobLookupError
+        except ImportError:                            # pragma: no cover
+            return
+        try:
+            self._sched.remove_job(name)
+        except JobLookupError:
+            return
+        logger.info("已摘除调度任务 %s（%s）", name, reason)
+
+    def _trigger_of(self, spec: JobSpec):
+        """按 spec 造 APScheduler 触发器。cron → CronTrigger，其余 → IntervalTrigger。"""
+        if spec.kind == "cron":
+            from apscheduler.triggers.cron import CronTrigger
+            return CronTrigger(hour=spec.hour, minute=spec.minute,
+                               day_of_week=spec.day_of_week or "mon-sun",
+                               timezone=self.timezone)
+        from apscheduler.triggers.interval import IntervalTrigger
+        return IntervalTrigger(seconds=spec.seconds, timezone=self.timezone)
+
+    def _add_job(self, spec: JobSpec, trigger=None) -> None:
+        """把一条启用的计划挂上 APScheduler（依赖 ``self._sched`` 已就位）。
+
+        ``name=spec.name`` 不是装饰：APScheduler 自己打的告警（如"实例数已达上限，
+        本次跳过"）用的是 ``Job.name``，而所有任务共用同一个回调
+        ``_guarded_fire``，不设 name 时告警里全是 ``TradingScheduler._guarded_fire``
+        ——三个 30 秒巡检任务刷出来的告警长得一模一样，根本归不到是哪个任务。
+        """
+        self._sched.add_job(self._guarded_fire, trigger or self._trigger_of(spec),
+                            args=[spec.name], id=spec.name, name=spec.name,
+                            misfire_grace_time=self.misfire, coalesce=True,
+                            max_instances=1, replace_existing=True)
 
     def describe(self) -> str:
         lines = [f"调度计划（tz={self.timezone}, enabled={self.enabled}）", "-" * 52]
@@ -239,6 +507,13 @@ class TradingScheduler:
         return "\n".join(lines)
 
     # ------------------------------------------------------------ 触发
+    def _spec_of(self, name: str) -> JobSpec | None:
+        """按任务名取计划。找不到返回 None（如 reload 后 job 尚未摘干净的残留触发）。"""
+        for spec in self.specs:
+            if spec.name == name:
+                return spec
+        return None
+
     def _fire(self, name: str) -> JobResult:
         from .jobs import run_job
         res = run_job(self.runner, name)
@@ -246,8 +521,22 @@ class TradingScheduler:
         logger.info("%s", res.render())
         return res
 
-    def _guarded_fire(self, name: str) -> None:
-        """APScheduler 的回调必须自己吞异常，否则线程池里的异常只会打日志然后消失。"""
+    def _guarded_fire(self, name: str, *, enforce_window: bool = True) -> None:
+        """APScheduler 的回调必须自己吞异常，否则线程池里的异常只会打日志然后消失。
+
+        ``enforce_window``：interval 任务是否受巡检窗口约束。正常触发一律受约束
+        （见 :meth:`JobSpec.in_window`）；``_on_job_missed`` 的补跑传 False ——
+        那是"机器休眠错过了整段窗口"的一次性补救决定，任务体自己还有
+        ``session.is_continuous`` 守卫，不该在这里被窗口再拦一次。
+        """
+        if enforce_window:
+            spec = self._spec_of(name)
+            if spec is not None and not spec.in_window(datetime.now()):
+                # 静默返回：不抢边界锁、不写 job_runs、不打 INFO。窗口外每 30 秒
+                # 刷一条 SKIP 正是"一堆空跑"的观感来源，而它对排查毫无价值。
+                logger.debug("任务 %s 不在巡检窗口（%s）内，本次触发跳过",
+                             name, spec.time_label)
+                return
         try:
             self._fire(name)
         except Exception:                            # noqa: BLE001
@@ -257,22 +546,17 @@ class TradingScheduler:
     def _build_apscheduler(self):
         try:
             from apscheduler.schedulers.background import BackgroundScheduler
-            from apscheduler.triggers.cron import CronTrigger
-            from apscheduler.triggers.interval import IntervalTrigger
         except ImportError:
             return None
 
         sched = BackgroundScheduler(timezone=self.timezone)
+        # _add_job 依赖 self._sched，必须先落字段再挂任务
+        self._sched = sched
         for spec in self.specs:
-            if spec.kind == "cron":
-                trigger = CronTrigger(hour=spec.hour, minute=spec.minute,
-                                      day_of_week=spec.day_of_week or "mon-sun",
-                                      timezone=self.timezone)
-            else:
-                trigger = IntervalTrigger(seconds=spec.seconds, timezone=self.timezone)
-            sched.add_job(self._guarded_fire, trigger, args=[spec.name], id=spec.name,
-                          misfire_grace_time=self.misfire, coalesce=True,
-                          max_instances=1, replace_existing=True)
+            if not spec.enabled:                     # 人工暂停 / 绑定策略全关 → 不注册
+                logger.info("调度任务 %s 未挂上日程（%s）", spec.name, spec.status_detail)
+                continue
+            self._add_job(spec)
         # 机器休眠/卡顿时 cron 触发点超过宽限期，APScheduler 会直接丢弃该次执行——
         # 任务没跑就不会打心跳，超过 24h 后被体检误判「组件失联」降级 REDUCE_ONLY。
         # 分两种处理：关键任务（data_sync/reconcile/intraday）错过 = 真实缺口，只补
@@ -302,7 +586,7 @@ class TradingScheduler:
                 return
             if name in CRITICAL_JOBS:
                 logger.warning("关键任务 %s 被错过（机器休眠/卡顿？），补跑本体", name)
-                self._guarded_fire(name)
+                self._guarded_fire(name, enforce_window=False)
             else:
                 self.runner._beat(name)              # noqa: SLF001 - 同包内可控
                 logger.warning("调度任务 %s 被错过，已补心跳防体检误判失联", name)
@@ -310,10 +594,32 @@ class TradingScheduler:
             logger.exception("错过补救失败")
 
     def _beat_all(self) -> None:
-        """进程启动即所有调度组件存活：补一轮心跳，清掉上一进程遗留的过期时间戳。"""
+        """进程启动即所有**启用中的**调度组件存活：补一轮心跳，清掉上一进程遗留的过期时间戳。
+
+        停用的任务不补心跳，反而要主动注销（见 ``_sync_beats``）。
+        """
+        self._sync_beats()
         for spec in self.specs:
+            if not spec.enabled:
+                continue
             try:
                 self.runner._beat(spec.name)         # noqa: SLF001
+            except Exception:                        # noqa: BLE001
+                pass
+
+    def _sync_beats(self) -> None:
+        """注销停用任务的心跳，防止体检把它们误判为"组件失联"。
+
+        ``HealthMonitor._check_heartbeats`` 会把库里所有 ``hb:job:*`` 都当活组件，
+        超过 24h 没跳就算失联 → ERROR（blocking）→ 自动降级 REDUCE_ONLY。任务停用
+        （人工暂停或随策略摘除）后不再触发、自然不再打心跳，残留的时间戳就会在
+        一天后把"关了个任务"放大成"全系统禁止开仓"。
+        """
+        for spec in self.specs:
+            if spec.enabled:
+                continue
+            try:
+                self.runner.ctx.monitor.forget(f"job:{spec.name}")
             except Exception:                        # noqa: BLE001
                 pass
 
@@ -325,6 +631,8 @@ class TradingScheduler:
             now = datetime.now()
             stamp = now.strftime("%Y-%m-%d %H:%M")
             for spec in self.specs:
+                if not spec.enabled:
+                    continue
                 if spec.kind == "cron":
                     if now.hour != spec.hour or now.minute != spec.minute:
                         continue
@@ -335,8 +643,7 @@ class TradingScheduler:
                     self._fired[spec.name] = stamp
                     self._guarded_fire(spec.name)
                 else:
-                    t = now.time()
-                    if spec.start_time and not (spec.start_time <= t <= spec.end_time):
+                    if not spec.in_window(now):
                         continue
                     if time.time() - last_intraday < spec.seconds:
                         continue
@@ -355,9 +662,13 @@ class TradingScheduler:
         self._beat_all()
         if self._sched is not None:
             self._sched.start()
-            logger.info("APScheduler 已启动，共 %d 项任务", len(self.specs))
+            logger.info("APScheduler 已启动：启用 %d 项任务，停用 %d 项（绑定策略未启用）",
+                        sum(1 for s in self.specs if s.enabled),
+                        sum(1 for s in self.specs if not s.enabled))
             return True
-        logger.warning("未安装 APScheduler，退化为内置轮询调度")
+        logger.warning("未安装 APScheduler，退化为内置轮询调度（启用 %d 项，停用 %d 项）",
+                       sum(1 for s in self.specs if s.enabled),
+                       sum(1 for s in self.specs if not s.enabled))
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, name="sched", daemon=True)
         self._thread.start()
@@ -424,4 +735,7 @@ def next_run_at(spec: JobSpec, now: datetime | None = None) -> datetime | None:
     return cand
 
 
-__all__ = ["JobSpec", "TradingScheduler", "next_run_at", "JOB_DESCRIPTIONS"]
+__all__ = ["JobSpec", "TradingScheduler", "next_run_at", "JOB_DESCRIPTIONS",
+           "JOB_STRATEGY_BINDING", "JOB_TIME_KEYS", "JOB_WINDOW_KEYS",
+           "JOB_INTERVAL_DEFAULTS", "job_interval_seconds",
+           "bound_strategy_enabled", "manual_enabled", "job_enabled"]

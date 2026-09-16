@@ -311,7 +311,7 @@ watch(() => props.mode, () => { recon.value = null; symbolDlg.value = null; load
       <div class="card">
         <h3>💰 实盘账户 <span class="sub">数据直连券商（QMT）</span>
           <span v-if="broker?.killswitch" class="badge" :class="killBadge(broker.killswitch)" :title="cnTitle(KILL_MODE, broker.killswitch)" style="margin-left:8px">
-            KillSwitch: {{ cn(KILL_MODE, broker.killswitch) }}
+            交易总开关：{{ cn(KILL_MODE, broker.killswitch) }}
           </span>
         </h3>
 
@@ -370,7 +370,7 @@ watch(() => props.mode, () => { recon.value = null; symbolDlg.value = null; load
     <!-- ============================ 对账（两 Tab 共用） ============================ -->
     <div class="card" v-if="recon">
       <h3>🔍 盘后对账
-        <span class="sub">本地账本 vs 券商持仓，差异未签核则强制 REDUCE_ONLY</span>
+        <span class="sub">本地账本 vs 券商持仓，差异未签核则强制降级为「只减不加」</span>
         <div class="spacer"></div>
         <button v-if="recon.available && !recon.passed" class="btn sm warn" @click="ackRecon">人工签核</button>
       </h3>

@@ -9,6 +9,7 @@ import pandas as pd
 from fastapi import APIRouter, HTTPException, Query
 
 import server.context as ctx
+from qmt_trade.core.errors import DataUnavailableError
 from qmt_trade.datahub.types import Adjust, Freq
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,8 @@ def get_bars(
             end=date.fromisoformat(end) if end else date.today(),
             adjust=getattr(Adjust, adjust, Adjust.QFQ),
         )
+    except DataUnavailableError:                 # 全源无数据（盘前/标的无历史）：非故障，降级为空
+        return {"rows": [], "count": 0}
     except Exception as exc:                     # noqa: BLE001
         raise HTTPException(500, f"取数失败: {exc}")
     if df is None or len(df) == 0:
@@ -118,6 +121,8 @@ def get_kline(
             [symbol], freq=Freq.D1, start=warm_start, end=end_d,
             adjust=getattr(Adjust, adjust, Adjust.QFQ),
         )
+    except DataUnavailableError:                 # 全源无数据（盘前/标的无历史）：非故障，降级为空
+        return {"rows": [], "count": 0, "period": period}
     except Exception as exc:                     # noqa: BLE001
         raise HTTPException(500, f"取数失败: {exc}")
     if df is None or len(df) == 0:
@@ -230,6 +235,11 @@ def get_timeline(
         return {"symbol": symbol, "date": None, "live": False, "prev_close": None,
                 "stale": False, "today": today.isoformat(),
                 "points": [], "quote": None, "note": f"标的无效或无分钟数据: {exc}"}
+    except DataUnavailableError:                 # 全源无分钟数据（盘前/数据源未就绪）：非故障，降级为空
+        return {"symbol": symbol, "date": None, "live": False, "prev_close": None,
+                "stale": False, "today": today.isoformat(),
+                "points": [], "quote": None,
+                "note": "当前无分钟数据（盘前或数据源未就绪）"}
     except Exception as exc:                     # noqa: BLE001
         raise HTTPException(500, f"分时数据获取失败: {exc}")
     if df is None or len(df) == 0:

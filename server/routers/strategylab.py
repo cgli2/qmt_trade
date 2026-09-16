@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from datetime import date
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 import server.context as ctx
@@ -201,13 +201,33 @@ class StrategyEnableIn(BaseModel):
 
 
 @router.put("/{sid}/enabled")
-def set_enabled(sid: str, body: StrategyEnableIn):
-    """切换策略启用开关（只写 strategies.<sid>.enabled）。"""
+def set_enabled(sid: str, body: StrategyEnableIn, request: Request):
+    """切换策略启用开关（只写 strategies.<sid>.enabled），并热更新常驻调度器。
+
+    调度任务与策略是硬联动的（见 ``scheduler.runner.JOB_STRATEGY_BINDING``）：
+    策略全关时对应任务连 job 都不注册，所以这里**必须** reload —— 否则开关改了、
+    日程还挂在旧状态上（该停的继续空跑，该起的到点不触发）。
+    """
     from qmt_trade.core.strategies import STANDALONE_STRATEGIES
+    from qmt_trade.scheduler.runner import JOB_STRATEGY_BINDING
 
     if sid not in STANDALONE_STRATEGIES:
         raise HTTPException(400, f"未知策略 {sid}")
     s = load_settings_editor()
     s.set(f"strategies.{sid}.enabled", bool(body.enabled))
     save_settings(s)
-    return {"ok": True, "sid": sid, "enabled": bool(body.enabled)}
+
+    # ---- 热更新常驻调度器（拿不到实例时提示重启即可）----
+    reloaded = False
+    sched = getattr(getattr(request.app, "state", None), "scheduler", None)
+    if sched is not None:
+        try:
+            reloaded = sched.reload()
+        except Exception as exc:                            # noqa: BLE001
+            raise HTTPException(500, f"策略开关已保存但调度器热更新失败: {exc}")
+    # 受影响的调度任务（供前端提示"哪些任务随之起停"）
+    affected = sorted(n for n, sids in JOB_STRATEGY_BINDING.items() if sid in sids)
+    return {"ok": True, "sid": sid, "enabled": bool(body.enabled),
+            "reloaded": reloaded, "affected_jobs": affected,
+            "hint": "已生效，绑定该策略的调度任务已同步起停" if reloaded
+                    else "配置已保存，重启后端后生效"}

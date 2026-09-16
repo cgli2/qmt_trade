@@ -23,6 +23,41 @@ from .base import Capability, DataProvider
 
 logger = get_logger("datahub.akshare")
 
+#: akshare/东财走的都是境内直连接口。本机若开了系统代理（如 Clash 127.0.0.1:7892），
+#: requests 会默认继承它；一旦代理未运行或不转发境内流量，就会 ProxyError 并阻塞数十秒
+#: （2026-09-15「获取全市场标的失败/极慢」事故根因）。这里把这些境内数据域名并入
+#: NO_PROXY 强制直连——**仅作用于列出的域名**，不影响 LLM 等需要代理的境外请求。
+_NO_PROXY_DOMAINS: tuple[str, ...] = (
+    "eastmoney.com", ".eastmoney.com",
+    "sina.com.cn", ".sina.com.cn",
+    "10jqka.com.cn", ".10jqka.com.cn",
+)
+
+
+def _ensure_direct_connect() -> None:
+    """把境内行情域名并入 NO_PROXY，让 akshare/requests 对其直连、绕过系统代理。
+
+    幂等：已存在的域名不重复追加，保留用户既有 NO_PROXY 条目。
+    可用环境变量 QMT_AKSHARE_DIRECT=0 关闭（例如本机代理确实能稳定转发境内流量）。
+    """
+    import os
+
+    if str(os.environ.get("QMT_AKSHARE_DIRECT", "1")).strip().lower() in ("0", "false", "no"):
+        return
+    cur = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+    have = {d.strip().lower() for d in cur.split(",") if d.strip()}
+    add = [d for d in _NO_PROXY_DOMAINS if d.lower() not in have]
+    if not add:
+        return
+    merged = ",".join([*( [cur] if cur else [] ), *add])
+    # requests 两个大小写都读，一并写回，避免被后续代码覆盖其一。
+    os.environ["NO_PROXY"] = merged
+    os.environ["no_proxy"] = merged
+    logger.info("akshare 直连：NO_PROXY 追加境内数据域名 %s", ",".join(add))
+
+
+_ensure_direct_connect()
+
 #: 公告标题关键词 → 事件类别。规则先行的事件识别，不依赖 LLM（设计 6.5.2）
 _EVENT_KEYWORDS: list[tuple[tuple[str, ...], EventCategory]] = [
     (("立案", "调查", "被查"), EventCategory.INVESTIGATION),
@@ -197,9 +232,18 @@ class AkshareProvider(DataProvider):
         s = str(start).replace("-", "")[:8] if start else "19900101"
         e = str(end).replace("-", "")[:8] if end else datetime.now().strftime("%Y%m%d")
         frames = []
+        # 批量取数护栏（2026-09-16 b8）：逐只请求在源限流/不可用时会被退避重试放大成
+        # 「数千只 × 数秒」的小时级挂起——曾把 selection 的当日增量拉取卡死，进而长时间
+        # 持有 _strategy_boundary_lock 拖垮整个调度器（所有 _guarded_fire 排队等锁）。
+        # 大批量时降低单只重试次数，并在「连续彻底失败」或「已查足够多标的却零命中」时
+        # 提前中止：两者都说明该源/该区间取不到数据，快速返回让上层降级到磁盘缓存。
+        n_syms = len(symbols)
+        max_attempts = 2 if n_syms > 50 else 4
+        consec_fail = 0
+        checked = 0
         for sym in symbols:
             df = None
-            for attempt in range(4):
+            for attempt in range(max_attempts):
                 try:
                     df = ak.stock_zh_a_hist(
                         symbol=_ak_symbol(sym), period="daily", start_date=s, end_date=e, adjust=adj
@@ -207,11 +251,28 @@ class AkshareProvider(DataProvider):
                     break
                 except Exception as exc:  # 网络抖动（东方财富接口偶发断连），退避重试
                     logger.debug("akshare 日线(%s) 第 %d 次失败: %s", sym, attempt + 1, exc)
-                    if attempt < 3:
+                    if attempt < max_attempts - 1:
                         import time as _t
                         _t.sleep(0.8 * (attempt + 1))
-            if df is None or df.empty:
+            checked += 1
+            if df is None:
+                # 所有重试均抛异常 → 网络/限流故障（区别于合法空），连续多只即判定源不可用
+                consec_fail += 1
+                if consec_fail >= 8:
+                    logger.warning(
+                        "akshare 日线连续 %d 只请求失败，判定源不可用，提前中止"
+                        "（已取 %d/%d 只，区间 %s~%s）", consec_fail, len(frames), n_syms, s, e)
+                    break
                 continue
+            if df.empty:
+                # 合法空（停牌/未收录/区间无数据，如盘前取当日）：不计连续失败；
+                # 但零命中累计到阈值即中止（该区间整体无数据，继续逐只拉取纯属浪费）。
+                if not frames and checked >= 50:
+                    logger.warning(
+                        "akshare 日线已检查 %d 只均无数据（区间 %s~%s），提前中止", checked, s, e)
+                    break
+                continue
+            consec_fail = 0
             df = df.rename(
                 columns={
                     "日期": "date", "开盘": "open", "收盘": "close", "最高": "high",

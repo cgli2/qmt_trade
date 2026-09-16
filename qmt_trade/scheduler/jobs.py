@@ -43,6 +43,69 @@ logger = logging.getLogger(__name__)
 #: 失败即视为"系统失去掌控"的任务，会自动降级到 REDUCE_ONLY
 CRITICAL_JOBS = frozenset({"data_sync", "reconcile", "intraday"})
 
+#: 抢策略边界锁的等待预算（秒）由 :func:`_lock_budget` 按任务自身周期推导，
+#: 下面几个常量只是推导的边界，不能当成"超时时间"直接拍板。
+#:
+#: **为什么必须有上限**：这把锁是**全任务共享**的，锁内还要跑一遍
+#: ``StrategyRepository.apply_at_boundary``（DuckDB 事务）。一旦某个长任务
+#: （selection 的当日增量取数、data_sync 预热）持锁数分钟，30 秒一 tick 的
+#: 三个巡检任务就会全部阻塞在锁上——APScheduler 眼里它们的"上一个实例还在跑"，
+#: 于是每个 tick 都刷一条 ``maximum number of running instances reached (1)``。
+#:
+#: **为什么上限又不能太小**：三个巡检任务同为 30 秒周期、同在 09:30 起跑，相位
+#: 是**锁死**的；开盘时段 ``etf_t0_intraday`` 单轮持锁实测 6~13s（全量 p95
+#: 12.6s）。预算若只有 5s，``intraday`` 每轮都在 etf 抢到锁后约 1s 触发、等 5s
+#: 必然超时，实测 13 轮里让路 12 轮——噪音是没了，持仓守护却被**安静地饿死**。
+#: ``intraday`` 属 CRITICAL_JOBS，这比刷日志严重得多。
+BOUNDARY_LOCK_WAIT_RATIO = 0.6
+#: 预算上限（秒）：再长就逼近 30 秒的巡检周期，"等锁 + 干活"会跨到下轮触发。
+BOUNDARY_LOCK_TIMEOUT_MAX = 20.0
+#: cron 型任务（一天一轮）的预算：撞上下轮触发在物理上不可能，等满一分钟远比
+#: 让路划算——让路意味着这一天这次机会直接没了（如 09:20 的 auction_check）。
+BOUNDARY_LOCK_TIMEOUT_CRON = 60.0
+
+#: 让路告警的限流窗口（秒）。长任务持锁数分钟时，30 秒一 tick × 三个巡检任务
+#: 会把"没抢到锁"刷成屏——那本身又成了新的噪音源。同一任务最多每
+#: ``_LOCK_WARN_INTERVAL`` 秒打一条，并带上这期间被抑制的次数。
+_LOCK_WARN_INTERVAL = 120.0
+_lock_warn_state: dict[str, tuple[float, int]] = {}
+
+
+def _lock_budget(runner: Any, name: str) -> float:
+    """算出本轮抢策略边界锁的等待预算（秒）。
+
+    两条约束必须同时成立：
+
+    * **够长** —— 等得完正常的持锁方，否则同周期任务相位锁死时会被稳定饿死；
+    * **够短** —— 明显小于自身周期，于是一次调用（等锁 + 干活）绝不会跨到下轮
+      触发，APScheduler 也就不会判"上一实例还在跑"而刷 MaxInstances。
+
+    周期优先取调度器发布的 ``ctx._job_intervals``（即触发器的真实周期），读不到
+    才回落配置：工作台改了周期而调度器尚未 reload 时两者不一致，以触发器为准。
+    """
+    ctx = getattr(runner, "ctx", None)
+    interval = int((getattr(ctx, "_job_intervals", None) or {}).get(name, 0) or 0)
+    if interval <= 0:
+        from .runner import job_interval_seconds     # 惰性：runner 模块级导入本模块
+        interval = job_interval_seconds(name, getattr(ctx, "settings", None))
+    if interval <= 0:
+        return BOUNDARY_LOCK_TIMEOUT_CRON
+    return max(1.0, min(BOUNDARY_LOCK_TIMEOUT_MAX,
+                        interval * BOUNDARY_LOCK_WAIT_RATIO))
+
+
+def _warn_lock_yield(name: str, budget: float) -> None:
+    """打一条限流后的"让路"告警。"""
+    now = time.time()
+    last, suppressed = _lock_warn_state.get(name, (0.0, 0))
+    if now - last < _LOCK_WARN_INTERVAL:
+        _lock_warn_state[name] = (last, suppressed + 1)
+        return
+    tail = f"（期间另有 {suppressed} 次同类让路未打出）" if suppressed else ""
+    _lock_warn_state[name] = (now, 0)
+    logger.warning("任务 %s 未抢到策略边界锁（等待上限 %.0fs），本轮让路%s",
+                   name, budget, tail)
+
 
 def _candidateset_picks(cs, top_n: int = 50) -> list[dict]:
     """从 CandidateSet 抽 Top N 推荐明细（rank/score/industry），供 UI 展示。"""
@@ -130,6 +193,11 @@ def job(name: str, *, critical: bool | None = None):
     """把一个方法包装成"永不抛异常、自动留痕"的调度任务。
 
     被包装方法可以返回 ``JobResult``、``dict``（并入 data）或 ``None``。
+
+    任务体在**策略边界锁**内执行（锁内先 ``apply_at_boundary``，保证任务读到的是
+    该边界已生效的策略参数）。锁是共享的，等待预算按任务自身周期推导（见
+    :func:`_lock_budget`）—— 抢不到就本轮让路并记一条 SKIP，而不是无限排队
+    把 APScheduler 逼出 ``maximum number of running instances reached``。
     """
     def deco(fn: Callable[..., Any]):
         @functools.wraps(fn)
@@ -141,9 +209,24 @@ def job(name: str, *, critical: bool | None = None):
                 from ..storage.strategies import StrategyRepository
                 if not hasattr(self.ctx, "_strategy_boundary_lock"):
                     self.ctx._strategy_boundary_lock = threading.RLock()
-                with self.ctx._strategy_boundary_lock:
+                lock = self.ctx._strategy_boundary_lock
+                budget = _lock_budget(self, name)
+                if not lock.acquire(timeout=budget):
+                    # 让路而不是无限排队：排队会让 APScheduler 认为"上一实例还在跑"，
+                    # 每 tick 刷一条 maximum number of running instances reached。
+                    # 心跳已在上面打过，体检不会把这次让路误读成任务失联。
+                    res = JobResult(
+                        name, skipped=True, elapsed=time.perf_counter() - t0,
+                        reason=f"策略边界锁被占用超 {budget:.0f}s，本轮让路")
+                    _warn_lock_yield(name, budget)
+                    self._record(res)
+                    self.history.append(res)
+                    return res
+                try:
                     StrategyRepository(self.ctx.repos.db).apply_at_boundary(self.ctx)
                     raw = fn(self, *args, **kw)
+                finally:
+                    lock.release()
             except Exception as exc:                # noqa: BLE001 - 调度层是最后一道防线
                 elapsed = time.perf_counter() - t0
                 res = JobResult(name, ok=False, reason=f"{type(exc).__name__}: {exc}",
@@ -191,7 +274,21 @@ class JobRunner:
         return self._forced_date or date.today()
 
     def _beat(self, name: str) -> None:
+        """打任务心跳。
+
+        任务未启用（人工暂停 **或** 绑定策略全关）时**不打**：调度器已把它从日程上
+        摘除，此处覆盖的是"人工点立即运行 / CLI ``run --once`` 单独跑了个停用任务"
+        的旁路——若留下 ``hb:job:*`` 时间戳，24h 后体检会把它当失联组件 → ERROR →
+        自动降级 REDUCE_ONLY（执行留痕 ``job:<name>:last_*`` 不受影响，照常写）。
+        """
         try:
+            # 惰性导入：runner 顶层 from .jobs import ...，此处反向引用会成环。
+            # 必须用 job_enabled（人工 AND 策略）而非 bound_strategy_enabled：
+            # 只看策略门禁的话，"用户手动暂停的任务"仍会被立即运行按钮写回心跳。
+            from ..core.config import get_settings
+            from .runner import job_enabled
+            if not job_enabled(name, get_settings()):
+                return
             self.ctx.monitor.heartbeat(f"job:{name}")
         except Exception:                            # noqa: BLE001
             pass
@@ -267,6 +364,9 @@ class JobRunner:
         if rows == 0:
             return JobResult("data_sync", ok=False, reason="抽样行情为空")
         if quality is not None and not quality.ok:
+            # 只有 issues 会走到这里；notes（停牌 OHLC=0、新股期无涨跌幅限制这类
+            # **合法**极端值）不参与拉闸判定 —— data_sync 属 CRITICAL_JOBS，
+            # 一次误判就会把全系统降级到 REDUCE_ONLY。
             return JobResult("data_sync", ok=False,
                              reason="数据质量不合格: " + str(quality)[:200])
 
@@ -283,7 +383,8 @@ class JobRunner:
             logger.warning("data_sync 写入同步水位失败: %s", exc)
         return JobResult("data_sync", ok=bool(healthy),
                          reason="" if healthy else "存在熔断中的数据源",
-                         data={"symbols": len(syms), "rows": rows})
+                         data={"symbols": len(syms), "rows": rows,
+                               "quality_notes": len(quality.notes) if quality else 0})
 
     # ============================================================ 07:30 市场状态
     @job("regime")
