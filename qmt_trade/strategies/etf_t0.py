@@ -182,6 +182,24 @@ class ETFT0Config(StrategyConfig):
             float(ov.get("momentum_threshold", self.momentum_threshold) or 0.0),
         )
 
+    def base_fraction_for(self, sym: str) -> float:
+        """返回某标的生效的底仓占比：``base_fraction_override[sym]`` > ``base_fraction``。
+
+        修复（2026-09-17）：``base_fraction_override`` 此前只有字段声明、全仓无任何
+        读取点，yaml 里配的 513100.SH=0.2 / 159941.SZ=0.8 形同虚设，实盘与回测都
+        一律按全局 ``base_fraction``（0.12）建仓。回测与实盘共用本方法（P7）。
+        返回值不做上限裁剪：超出 Gate-1 / Regime 上限时应由风控链明确拒单并留下
+        可读拒因，而不是在这里被悄悄截断成 0.15 后无人知晓。
+        """
+        ov = self.base_fraction_override or {}
+        v = ov.get(sym)
+        if v is None:
+            return float(self.base_fraction or 0.0)
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return float(self.base_fraction or 0.0)
+
 
 # ============================================================================ 回测
 class ETFT0Backtester:
@@ -208,6 +226,9 @@ class ETFT0Backtester:
         self._minute_cache: dict[tuple[str, date], pd.DataFrame | None] = {}
         self._seq = 0
         self._minute_available = False
+        # 回测专用：按「平腿原因」分项的腿级流水，用于诊断 T0 的钱到底从哪来/哪去。
+        # 只在回测器里初始化，实盘 ETFT0Strategy 走 getattr 兜底，不影响交易逻辑。
+        self._leg_log: list[dict] = []
 
     # ------------------------------------------------------------ 主入口
     def run(self, start: date, end: date) -> StrategyResult:
@@ -266,6 +287,18 @@ class ETFT0Backtester:
             result.metrics["t0_win_legs"] = t0["wins"]
             result.metrics["t0_loss_legs"] = t0["losses"]
             result.metrics["minute_available"] = self._minute_available
+            # 按平腿原因分项：一眼看出 T0 的钱是从哪类平腿来的、哪类在漏钱
+            if getattr(self, "_leg_log", None):
+                agg: dict[str, dict] = {}
+                for rec in self._leg_log:
+                    a = agg.setdefault(rec["tag"], {"n": 0, "pnl": 0.0})
+                    a["n"] += 1
+                    a["pnl"] += rec["pnl"]
+                result.metrics["t0_by_tag"] = {
+                    k: {"legs": v["n"], "pnl": round(v["pnl"], 2),
+                        "avg_pnl": round(v["pnl"] / v["n"], 2)}
+                    for k, v in sorted(agg.items(), key=lambda kv: -kv[1]["pnl"])
+                }
         self.details = [
             f"ETF T+0 回测：标的={universe}，分钟线={'可用' if self._minute_available else '不可用'}",
             f"做T腿数={t0['legs']}，平腿={t0['closed']}，胜腿={t0['wins']}，亏腿={t0['losses']}，"
@@ -296,7 +329,8 @@ class ETFT0Backtester:
             px = float(bar.get("open") or 0)
             if px <= 0:
                 continue
-            notional = min(self.initial_cash * cfg.base_fraction,
+            frac = cfg.base_fraction_for(sym)
+            notional = min(self.initial_cash * frac,
                            self.portfolio.cash * 0.98)
             if notional <= 0:
                 continue
@@ -360,13 +394,25 @@ class ETFT0Backtester:
                             ref = leg_px * (1 + cfg.stop_pct)
                             if self._fill(sym, "BUY", int(leg["qty"]), ref, bar, day,
                                           "ETF_T0_STOP_BUYBACK"):
-                                day_pnl += (leg_px - ref) * int(leg["qty"])
+                                _p = (leg_px - ref) * int(leg["qty"])
+                                day_pnl += _p
+                                self._log_leg("反向止损买回", _p, int(leg["qty"]))
                                 self._settle_leg(t0, leg, False)
                                 closed = True
-                        elif px <= leg_px * (1 - cfg.grid_step) or dv <= cfg.close_leg_dev:
-                            if self._fill(sym, "BUY", int(leg["qty"]), px, bar, day,
-                                          "ETF_T0_BUYBACK"):
-                                day_pnl += (leg_px - px) * int(leg["qty"])
+                        else:
+                            # 与原逻辑等价（两者都在 px 成交），此处只是**拆开打标签**
+                            # 以便诊断：钱到底是网格止盈赚的，还是回归 VWAP 赚的。
+                            if dv <= cfg.close_leg_dev:
+                                tag, ref = "回归VWAP买回", px
+                            elif px <= leg_px * (1 - cfg.grid_step):
+                                tag, ref = "网格止盈买回", px
+                            else:
+                                tag, ref = "", 0.0
+                            if tag and self._fill(sym, "BUY", int(leg["qty"]), ref, bar, day,
+                                                  "ETF_T0_BUYBACK"):
+                                _p = (leg_px - ref) * int(leg["qty"])
+                                day_pnl += _p
+                                self._log_leg(tag, _p, int(leg["qty"]))
                                 self._settle_leg(t0, leg, True)
                                 closed = True
                     else:                                          # BUY 腿，等卖出
@@ -374,13 +420,23 @@ class ETFT0Backtester:
                             ref = leg_px * (1 - cfg.stop_pct)
                             if self._fill(sym, "SELL", int(leg["qty"]), ref, bar, day,
                                           "ETF_T0_STOP_EXIT"):
-                                day_pnl += (ref - leg_px) * int(leg["qty"])
+                                _p = (ref - leg_px) * int(leg["qty"])
+                                day_pnl += _p
+                                self._log_leg("反向止损卖出", _p, int(leg["qty"]))
                                 self._settle_leg(t0, leg, False)
                                 closed = True
-                        elif px >= leg_px * (1 + cfg.grid_step) or dv >= -cfg.close_leg_dev:
-                            if self._fill(sym, "SELL", int(leg["qty"]), px, bar, day,
-                                          "ETF_T0_EXIT"):
-                                day_pnl += (px - leg_px) * int(leg["qty"])
+                        else:
+                            if dv >= -cfg.close_leg_dev:
+                                tag, ref = "回归VWAP卖出", px
+                            elif px >= leg_px * (1 + cfg.grid_step):
+                                tag, ref = "网格止盈卖出", px
+                            else:
+                                tag, ref = "", 0.0
+                            if tag and self._fill(sym, "SELL", int(leg["qty"]), ref, bar, day,
+                                                  "ETF_T0_EXIT"):
+                                _p = (ref - leg_px) * int(leg["qty"])
+                                day_pnl += _p
+                                self._log_leg(tag, _p, int(leg["qty"]))
                                 self._settle_leg(t0, leg, True)
                                 closed = True
                     if closed:
@@ -420,11 +476,15 @@ class ETFT0Backtester:
                         if leg["side"] == "SELL":
                             self._fill(sym, "BUY", int(leg["qty"]), px, bar, day,
                                        "ETF_T0_FORCE_FLAT")
-                            day_pnl += (leg_px - px) * int(leg["qty"])
+                            _p = (leg_px - px) * int(leg["qty"])
+                            day_pnl += _p
+                            self._log_leg("尾盘强平买回", _p, int(leg["qty"]))
                         else:
                             self._fill(sym, "SELL", int(leg["qty"]), px, bar, day,
                                        "ETF_T0_FORCE_FLAT")
-                            day_pnl += (px - leg_px) * int(leg["qty"])
+                            _p = (px - leg_px) * int(leg["qty"])
+                            day_pnl += _p
+                            self._log_leg("尾盘强平卖出", _p, int(leg["qty"]))
                         self._settle_leg(t0, leg,
                                          px < leg_px if leg["side"] == "SELL" else px > leg_px)
                     legs.clear()
@@ -440,11 +500,15 @@ class ETFT0Backtester:
                     leg_px = float(leg["price"])
                     if leg["side"] == "SELL":
                         self._fill(sym, "BUY", int(leg["qty"]), px, bar, day, "ETF_T0_FORCE_FLAT")
-                        day_pnl += (leg_px - px) * int(leg["qty"])
+                        _p = (leg_px - px) * int(leg["qty"])
+                        day_pnl += _p
+                        self._log_leg("收盘强平买回", _p, int(leg["qty"]))
                         self._settle_leg(t0, leg, px < leg_px)
                     else:
                         self._fill(sym, "SELL", int(leg["qty"]), px, bar, day, "ETF_T0_FORCE_FLAT")
-                        day_pnl += (px - leg_px) * int(leg["qty"])
+                        _p = (px - leg_px) * int(leg["qty"])
+                        day_pnl += _p
+                        self._log_leg("收盘强平卖出", _p, int(leg["qty"]))
                         self._settle_leg(t0, leg, px > leg_px)
                 legs.clear()
         return day_pnl
@@ -455,6 +519,19 @@ class ETFT0Backtester:
             t0["wins"] += 1
         else:
             t0["losses"] += 1
+
+    def _log_leg(self, tag: str, pnl: float, qty: int) -> None:
+        """记录一条平腿流水，按「平腿原因」分项，用于诊断 T0 的钱从哪来/哪去。
+
+        口径提醒：``pnl`` 是**价差口径**（已含 SimGateway 注入的买卖滑点），
+        **不含**佣金/印花税/过户费——那三项走 ``portfolio.apply_fill``，
+        体现在总权益曲线里，不体现在这里的腿级盈亏上。所以腿级盈亏之和
+        会略高于它们对总权益的真实贡献。
+        """
+        log = getattr(self, "_leg_log", None)
+        if log is None:
+            return
+        log.append({"tag": tag, "pnl": float(pnl), "qty": int(qty)})
 
     @staticmethod
     def _slice_qty(base_shares: int, cfg: ETFT0Config) -> int:
@@ -721,6 +798,14 @@ class ETFT0LiveRunner:
             return {"skipped": True, "reason": "enabled=false（UI 停用）"}
         if not self.ctx.calendar.is_trading_day(self.jr.today):
             return {"skipped": True, "reason": "非交易日"}
+        # A 股 T+1 解冻（2026-09-17）：此前只有主策略 intraday 任务会调 mark_t1，
+        # 主策略一停（或本策略单独运行），隔夜底仓的 can_use 就永远停在 0，先卖后买
+        # 一条腿也开不出来。mark_t1 幂等，且只解冻"持有满 1 日"的份额，
+        # 不会提前解冻当日买入 —— 补在这里让 ETF T+0 自洽，不依赖别的任务。
+        try:
+            self.ctx.portfolio.mark_t1(self.jr.today)
+        except Exception as exc:                       # noqa: BLE001
+            logger.warning("ETF T+0 mark_t1 失败: %s", exc)
         now = datetime.now()
         session = self.ctx.calendar.session_of(now)
         if not session.is_continuous:
@@ -729,9 +814,13 @@ class ETFT0LiveRunner:
         open_start, open_end = _parse_t(cfg.open_t_start), _parse_t(cfg.open_t_end)
         force_flat = _parse_t(cfg.force_flat_time)
         state = self._load_state()
+        # open_skip_reasons/open_reject_reasons/close_fail_reasons（2026-09-17）：
+        # 记录"为什么没开腿/没平腿"，让 legs_opened=0 不再是黑盒。
         summary = {"skipped": False, "symbols": 0, "legs_opened": 0,
                    "legs_closed": 0, "fills": 0, "rejected": 0,
-                   "forced_flat": False, "base": 0, "base_reject_reasons": {}}
+                   "forced_flat": False, "base": 0, "base_reject_reasons": {},
+                   "open_reject_reasons": {}, "open_skip_reasons": {},
+                   "close_fail_reasons": {}}
 
         for sym in cfg.symbols:
             bars = self._minute_bars(sym)
@@ -769,15 +858,22 @@ class ETFT0LiveRunner:
 
             # ---- 1) 平腿（止损 → 网格/回归）----
             for leg in list(st.get("legs", [])):
-                if self._close_leg(sym, leg, price, dv, cfg, st):
+                ok, why = self._close_leg(sym, leg, price, dv, cfg, st)
+                if ok:
                     summary["legs_closed"] += 1
                     summary["fills"] += 1
+                elif "被拒" in why:
+                    # "未到平腿条件"是常态，不记；只有真被风控/网关拦下才记
+                    self._bump(summary, "close_fail_reasons", why)
             # ---- 2) 尾盘强平 + 一次性买回未回补部分 ----
             if tv >= force_flat:
                 for leg in list(st.get("legs", [])):
-                    if self._close_leg(sym, leg, price, dv, cfg, st, force=True):
+                    ok, why = self._close_leg(sym, leg, price, dv, cfg, st, force=True)
+                    if ok:
                         summary["legs_closed"] += 1
                         summary["fills"] += 1
+                    elif "被拒" in why:
+                        self._bump(summary, "close_fail_reasons", why)
                 if st.get("legs"):
                     summary["forced_flat"] = True
                 if st.get("sold_qty", 0) > st.get("bought_qty", 0):
@@ -792,12 +888,15 @@ class ETFT0LiveRunner:
                 last_ts = st.get("last_trade_time") or ""
                 if not self._interval_ok(last_ts, tv, cfg.min_interval_minutes):
                     continue
-                opened = self._open_leg(sym, price, dv, mom, st, cfg)
+                opened, why = self._open_leg(sym, price, dv, mom, st, cfg)
                 if opened == "opened":
                     summary["legs_opened"] += 1
                     summary["fills"] += 1
                 elif opened == "rejected":
                     summary["rejected"] += 1
+                    self._bump(summary, "open_reject_reasons", why)
+                else:
+                    self._bump(summary, "open_skip_reasons", why)
         self._save_state(state)
         return summary
 
@@ -823,8 +922,49 @@ class ETFT0LiveRunner:
         open_end = _parse_t(cfg.open_t_end)
         if not (open_start <= tv <= open_end):
             return False
+        frac = cfg.base_fraction_for(sym)
+        # ---- 统一仓位预算（2026-09-17「规则统一」）----
+        # 此前 ETF T+0 只按 base_fraction 闷头建仓，完全不知道 Regime 上限：
+        # 建到一半被 Gate-1 拒（"总仓位已达 Regime 上限"），或建完立刻被 Gate-2
+        # 的 REGIME_CUT 砍掉——"底仓隔夜不动"与"Regime 降总仓位"互相打架。
+        # 这里改用与 Gate-1/Gate-2 完全相同的口径（portfolio.market_value() 现价市值）
+        # 先算可用额度，把底仓意图收敛到额度内；额度为 0 就直接不建。
+        # 收敛/放弃都会写日志并聚合进 summary，绝不静默。
+        snap = self._regime_snapshot()
+        cap = float(getattr(snap, "max_position", 0.0) or 0.0)
+        pf = self.ctx.portfolio
+        total = max(pf.total_asset, 1.0)
+        used_w = pf.market_value() / total
+        if cap > 0:
+            headroom = cap - used_w
+            if headroom <= 0.0:
+                reason = (f"Regime 可用额度为 0：cap={cap:.0%}，当前仓位 {used_w:.1%} "
+                          f"——不建底仓，避免建完即被 REGIME_CUT 砍")
+                logger.warning("ETF T+0 %s %s 底仓被统一仓位预算拦下 @%.3f :: %s",
+                               self.jr.today, sym, price, reason)
+                if summary is not None:
+                    summary["rejected"] += 1
+                    self._bump(summary, "base_reject_reasons", reason)
+                return False
+            if frac > headroom:
+                logger.warning(
+                    "ETF T+0 %s %s 底仓意图 %.1f%% 被 Regime 可用额度收敛至 %.1f%%"
+                    "（cap=%.0f%%，当前仓位 %.1f%%）——与 Gate-1/Gate-2 同口径，"
+                    "避免建完即触发减仓", self.jr.today, sym, frac * 100,
+                    headroom * 100, cap * 100, used_w * 100)
+                if summary is not None:
+                    self._bump(summary, "base_reject_reasons",
+                               "底仓意图被 Regime 可用额度收敛至 #（cap=#，当前仓位 #）")
+                frac = headroom
+        if frac < 0.01:
+            reason = f"底仓可用额度 {frac:.2%} 过小，放弃建仓"
+            logger.warning("ETF T+0 %s %s %s", self.jr.today, sym, reason)
+            if summary is not None:
+                summary["rejected"] += 1
+                self._bump(summary, "base_reject_reasons", reason)
+            return False
         res = self._submit(sym, "BUY", price, signal="ETF_T0_BASE",
-                           max_weight_hint=max(0.02, min(0.15, cfg.base_fraction)))
+                           max_weight_hint=max(0.01, min(1.0, frac)))
         if res is not None and res.ok and res.fill is not None:
             st["base_done"] = True
             return True
@@ -846,12 +986,24 @@ class ETFT0LiveRunner:
 
     # ------------------------------------------------------------ 腿操作
     def _open_leg(self, sym: str, price: float, dv: float, mom: float, st: dict,
-                  cfg: ETFT0Config) -> str:
+                  cfg: ETFT0Config) -> tuple[str, str]:
+        """尝试开一条卖出腿。返回 ``(status, reason)``，status ∈ opened/rejected/skipped。
+
+        修复（2026-09-17）：此前每个失败分支都只回一个裸字符串，且 ``dv`` 判定排在
+        ``can_use`` 之前 —— 被 T+1 可卖数量卡死时根本走不到 can_use 分支，日志呈现
+        ``legs_opened=0 且 rejected=0``，完全看不出卡在哪。这里让每条路径都带上人类
+        可读的原因，由 tick 归一化后聚合进 summary，只恢复可观测性，不改交易逻辑。
+        """
         pos = self.ctx.portfolio.positions.get(sym)
         base_shares = int(pos.shares) if pos else 0
-        slice_qty = self._slice_qty(base_shares, cfg) if base_shares > 0 else 0
-        if slice_qty <= 0 or slice_qty > base_shares:
-            return "skipped"
+        if base_shares <= 0:
+            return "skipped", "无底仓（shares=0，等待 _ensure_base 建仓）"
+        slice_qty = self._slice_qty(base_shares, cfg)
+        if slice_qty <= 0:
+            return "skipped", (f"切片取整后为 0（底仓 {base_shares} 股 × "
+                               f"t_slice_ratio={cfg.t_slice_ratio}）")
+        if slice_qty > base_shares:
+            return "skipped", f"切片 {slice_qty} 超过底仓 {base_shares}"
         # 实盘只做先卖后买（A 股 T+1 账本：当日买入份额当日不可卖，先买后卖无法平腿）。
         # same_day_roundtrip 仅用于回测评估真 T+0 标的。
         if cfg.same_day_roundtrip and not self._warned_roundtrip:
@@ -859,76 +1011,118 @@ class ETFT0LiveRunner:
             logger.warning(
                 "ETF T+0 %s：实盘不支持先买后卖（T+1 账本当日买入不可卖），"
                 "same_day_roundtrip 仅在回测生效，实盘忽略该分支", self.jr.today)
-        if dv >= cfg.sell_dev_threshold:
-            # 动量模式判定（off/filter/confirm，按标解析 override，与回测共用）
-            if not mom_sell_ok(cfg, mom, sym):
-                return "skipped"
-            if pos is None or pos.can_use < slice_qty:
-                return "rejected"
-            # 上一卖出腿尚未回补时不叠开（防累计净空）
-            if st.get("sold_qty", 0) - st.get("bought_qty", 0) >= slice_qty:
-                return "skipped"
-            res = self._submit(sym, "REDUCE", price, reduce_shares=slice_qty,
-                               signal="ETF_T0_SELL", max_weight_hint=0.03)
-            if res is None or not res.ok or res.fill is None:
-                return "rejected"
-            qty = int(res.fill.quantity)
-            st["sold_qty"] = st.get("sold_qty", 0) + qty
-            st.setdefault("legs", []).append(
-                {"side": "SELL", "qty": qty, "price": float(res.fill.price),
-                 "opened_at": datetime.now().strftime("%H:%M")})
-            st["trades_today"] = st.get("trades_today", 0) + 1
-            st["last_trade_time"] = datetime.now().strftime("%H:%M")
-            return "opened"
-        return "skipped"
+        if dv < cfg.sell_dev_threshold:
+            return "skipped", (f"未达卖出偏离：dv={dv:.4f} < "
+                               f"sell_dev_threshold={cfg.sell_dev_threshold}")
+        # 动量模式判定（off/filter/confirm，按标解析 override，与回测共用）
+        if not mom_sell_ok(cfg, mom, sym):
+            m_mode, _win, m_thr = cfg.momentum_params_for(sym)
+            return "skipped", (f"动量{m_mode}未放行：mom={mom:.4f} "
+                               f"(threshold={m_thr})")
+        can_use = int(getattr(pos, "can_use", 0) or 0)
+        if pos is None or can_use < slice_qty:
+            return "rejected", (f"T+1 可卖不足：can_use={can_use} < 需卖 {slice_qty}"
+                                f"（底仓 {base_shares} 股，T+1 未解冻）")
+        # 上一卖出腿尚未回补时不叠开（防累计净空）
+        if st.get("sold_qty", 0) - st.get("bought_qty", 0) >= slice_qty:
+            return "skipped", "上一卖出腿尚未回补，防叠开"
+        res = self._submit(sym, "REDUCE", price, reduce_shares=slice_qty,
+                           signal="ETF_T0_SELL", max_weight_hint=0.03)
+        if res is None or not res.ok or res.fill is None:
+            return "rejected", self._res_reason(res)
+        qty = int(res.fill.quantity)
+        st["sold_qty"] = st.get("sold_qty", 0) + qty
+        st.setdefault("legs", []).append(
+            {"side": "SELL", "qty": qty, "price": float(res.fill.price),
+             "opened_at": datetime.now().strftime("%H:%M")})
+        st["trades_today"] = st.get("trades_today", 0) + 1
+        st["last_trade_time"] = datetime.now().strftime("%H:%M")
+        return "opened", f"已开卖出腿 {qty} 股"
+        return "skipped", "未满足任何开腿条件"
 
     def _close_leg(self, sym: str, leg: dict, price: float, dv: float,
-                   cfg: ETFT0Config, st: dict, *, force: bool = False) -> bool:
+                   cfg: ETFT0Config, st: dict, *, force: bool = False) -> tuple[bool, str]:
+        """尝试平一条腿。返回 ``(是否成交, 原因)``。
+
+        修复（2026-09-17）：此前所有失败路径都只回裸 ``False``，且"未到平腿条件"
+        与"下单被风控拒"无法区分，日志里表现为 legs_closed=0 且 rejected=0。
+        这里补上原因，由 tick 聚合进 summary。只恢复可观测性，不改交易逻辑。
+        """
         leg_px = float(leg["price"])
         qty = int(leg.get("qty") or 0)
         if qty <= 0:
             st.setdefault("legs", []).remove(leg)
-            return False
+            return False, "腿数量为 0，已丢弃"
         if leg["side"] == "SELL":                      # 等买回
             if force:
                 res = self._submit(sym, "BUY", price, signal="ETF_T0_FORCE_FLAT",
                                    max_weight_hint=self._buy_hint(sym, price, st, cfg))
+                tag = "尾盘强平买回"
             elif price >= leg_px * (1 + cfg.stop_pct):
                 res = self._submit(sym, "BUY", leg_px * (1 + cfg.stop_pct),
                                    signal="STOP_LOSS",
                                    max_weight_hint=self._buy_hint(sym, price, st, cfg))
+                tag = "反向止损买回"
             elif price <= leg_px * (1 - cfg.grid_step) or dv <= cfg.close_leg_dev:
                 res = self._submit(sym, "BUY", price, signal="ETF_T0_BUYBACK",
                                    max_weight_hint=self._buy_hint(sym, price, st, cfg))
+                tag = "网格/回归买回"
             else:
-                return False
+                return False, (f"未到买回条件（price={price:.3f} "
+                               f"leg_px={leg_px:.3f} dv={dv:.4f}）")
             if res is None or not res.ok or res.fill is None:
-                return False
+                return False, f"{tag}被拒: {self._res_reason(res)}"
             qty_f = int(res.fill.quantity)
             st["bought_qty"] = st.get("bought_qty", 0) + qty_f
-            st["day_pnl"] = st.get("day_pnl", 0.0) + (leg_px - float(res.fill.price)) * qty_f
+            st["day_pnl"] = (st.get("day_pnl", 0.0)
+                             + (leg_px - float(res.fill.price)) * qty_f)
             st.setdefault("legs", []).remove(leg)
-            return True
+            return True, f"{tag} {qty_f} 股"
         # BUY 腿，等卖出（实盘不会开出；历史状态恢复时兜底）
         if force:
             res = self._submit(sym, "REDUCE", price, reduce_shares=qty,
                                signal="ETF_T0_FORCE_FLAT", max_weight_hint=0.03)
+            tag = "尾盘强平卖出"
         elif price <= leg_px * (1 - cfg.stop_pct):
             res = self._submit(sym, "REDUCE", leg_px * (1 - cfg.stop_pct),
                                reduce_shares=qty, signal="STOP_LOSS",
                                max_weight_hint=0.03)
+            tag = "反向止损卖出"
         elif price >= leg_px * (1 + cfg.grid_step) or dv >= -cfg.close_leg_dev:
             res = self._submit(sym, "REDUCE", price, reduce_shares=qty,
                                signal="ETF_T0_EXIT", max_weight_hint=0.03)
+            tag = "网格/回归卖出"
         else:
-            return False
+            return False, (f"未到卖出条件（price={price:.3f} "
+                           f"leg_px={leg_px:.3f} dv={dv:.4f}）")
         if res is None or not res.ok or res.fill is None:
-            return False
+            return False, f"{tag}被拒: {self._res_reason(res)}"
         qty_f = int(res.fill.quantity)
         st["sold_qty"] = st.get("sold_qty", 0) + qty_f
-        st["day_pnl"] = st.get("day_pnl", 0.0) + (float(res.fill.price) - leg_px) * qty_f
+        st["day_pnl"] = (st.get("day_pnl", 0.0)
+                         + (float(res.fill.price) - leg_px) * qty_f)
         st.setdefault("legs", []).remove(leg)
-        return True
+        return True, f"{tag} {qty_f} 股"
+
+    @staticmethod
+    def _res_reason(res: Any) -> str:
+        """把 ``submit_intent`` 的返回折成人类可读拒因（三态归一）。"""
+        if res is None:
+            return "无行情_bar（_submit 返回 None）"
+        if getattr(res, "rejected_by", None):
+            return f"{res.rejected_by}: {res.reason}"
+        return getattr(res, "reason", None) or "未知（ok=False 且无 rejected_by）"
+
+    @staticmethod
+    def _bump(summary: dict, field: str, reason: str) -> None:
+        """把一条原因归一化后累加进 summary 的聚合字典。
+
+        归一化（数字折成 '#'）是必须的：T+1 可卖数量、dv、止损距离这些实时数字
+        逐笔都不同，直接当 key 会每条一个键，聚合结果根本读不懂。
+        """
+        bucket = summary.setdefault(field, {})
+        key = _normalize_reject(reason)
+        bucket[key] = bucket.get(key, 0) + 1
 
     def _buy_hint(self, sym: str, price: float, st: dict, cfg: ETFT0Config) -> float:
         """买回 intent 的 max_weight_hint：按剩余未回补金额占组合比例给提示。"""

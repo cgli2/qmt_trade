@@ -44,7 +44,23 @@ class PortfolioState:
     @property
     def position_value(self) -> float:
         # 现价口径：无现价（回测未刷新/刚建仓）时兜底成本价，保证不低估现金占比
-        return sum(p.shares * (p.last_price or p.avg_cost) for p in self.positions.values())
+        return self.market_value()
+
+    def market_value(self, last_prices: dict[str, float] | None = None) -> float:
+        """统一口径的持仓市值 —— **风控唯一的市值真相源**。
+
+        价格优先级：外部传入的 ``last_prices`` > 持仓缓存的 ``last_price`` > 成本价。
+
+        修复（2026-09-17「规则统一」）：此前 Gate-1 用 ``avg_cost`` 算总仓位、
+        Gate-2 的 ``_regime_deleverage`` 又用 ``last_prices`` 另算一遍，两处口径不同
+        —— 浮盈时 Gate-1（成本价）认为没超限而放行买入，Gate-2（现价）转头判定
+        超限并立刻减仓，出现「刚建仓就被 REGIME_CUT 砍掉」的自相矛盾。
+        Gate-1 / Gate-2 / 策略层建仓自检必须共用本方法。
+        """
+        lp = last_prices or {}
+        return sum(
+            p.shares * float(lp.get(s) or p.last_price or p.avg_cost or 0.0)
+            for s, p in self.positions.items())
 
     @property
     def total_asset(self) -> float:

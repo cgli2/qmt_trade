@@ -30,6 +30,11 @@ _MA_CHECK_RE = re.compile(
     r"(?:跌破|下破|失守).{0,4}?(\d{1,3})\s*(?:日|天)?(?:均线|日线|ma|MA)"
 )
 
+#: Regime 总仓位上限的缓冲系数。**Gate-1（拦买入）与 Gate-2（主动减仓）必须共用**，
+#: 否则会出现「Gate-1 贴着 100% 放行 → Gate-2 带 2% 缓冲判定超限立刻减仓」的抖动。
+#: 统一为同一个值：超 cap×1.02 才算超限，给 Gate-1 留出与 Gate-2 一致的判定边界。
+REGIME_CAP_BUFFER = 1.02
+
 
 class GuardAction(NamedTuple):
     """Gate-2 判定结果。``tag`` 为机器可读的平仓原因码。"""
@@ -90,7 +95,16 @@ class RiskEngine:
         sym_industry: dict[str, str],
         daily_open_count: int = 0,
         high_corr_count: int = 0,
+        net_new_exposure: bool = True,
     ) -> RiskVerdict:
+        """Gate-1 前置闸门。
+
+        ``net_new_exposure=False`` 表示本次买入是**回补**（当日已有对应卖出，
+        净敞口不增加，例如 ETF T+0 卖出腿的买回平腿）。此时跳过「总仓位 vs
+        Regime 上限」校验——否则会出现「允许先卖后买，却不允许把卖掉的买回来」
+        的自相矛盾，T 仓平不掉、尾盘强平也补不回，底仓被风控一点点吃掉。
+        注意这不豁免 Regime 减仓本身：该减的照减，只是减完之后的回补不算新增敞口。
+        """
         v = RiskVerdict(allow=True)
         sym = intent.symbol
         side = intent.side
@@ -149,11 +163,17 @@ class RiskEngine:
                 v.deny(f"行业 {ind} 权重已达上限 {self.max_industry_weight:.0%}")
             if high_corr_count >= 3:
                 v.deny(f"与现有持仓高相关(>0.8)标的数 {high_corr_count} ≥ 3")
-            # 总仓位 vs Regime 上限
-            if regime.max_position > 0:
-                used = sum(p.shares * p.avg_cost for p in portfolio.positions.values())
-                if used >= regime.max_position * portfolio.total_asset:
-                    v.deny(f"总仓位已达 Regime 上限 {regime.max_position:.0%}")
+            # 总仓位 vs Regime 上限（统一口径 2026-09-17）
+            # 此前用 avg_cost 另算一遍，与 Gate-2 的现价口径不一致：浮盈时 Gate-1
+            # 认为没超限而放行买入，Gate-2 转头判定超限立刻减仓。现统一走
+            # portfolio.market_value()（现价口径）+ 与 Gate-2 相同的缓冲系数。
+            if regime.max_position > 0 and net_new_exposure:
+                used = portfolio.market_value()
+                cap = regime.max_position * portfolio.total_asset * REGIME_CAP_BUFFER
+                if used >= cap:
+                    w = used / portfolio.total_asset if portfolio.total_asset else 0.0
+                    v.deny(f"总仓位已达 Regime 上限 {regime.max_position:.0%}"
+                           f"（当前 {w:.1%}）")
 
         # ---- 资金 ----
         if side is Side.BUY:
@@ -289,10 +309,10 @@ class RiskEngine:
         total = portfolio.total_asset or 0.0
         if total <= 0 or not portfolio.positions:
             return out
-        mv = sum(
-            p.shares * float(last_prices.get(s) or p.avg_cost)
-            for s, p in portfolio.positions.items())
-        if mv <= cap * total * 1.02:      # 2% 缓冲，避免贴着上限反复减
+        # 统一口径（2026-09-17）：与 Gate-1 共用 portfolio.market_value() 和
+        # REGIME_CAP_BUFFER，杜绝"两处各算一遍、结论互相打架"。
+        mv = portfolio.market_value(last_prices)
+        if mv <= cap * total * REGIME_CAP_BUFFER:      # 2% 缓冲，避免贴着上限反复减
             return out
         if cap <= 0:
             return [GuardAction(s, "SELL", f"Regime={regime.regime.value} 总仓位清零",

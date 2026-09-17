@@ -300,7 +300,12 @@ class Secrets:
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     """全局单例。测试里请直接构造 ``Settings(dict)`` 而不是用这个。"""
-    return Settings.load()
+    s = Settings.load()
+    # 仓位/额度参数自洽性审计：只告警，绝不改值、绝不改交易行为。
+    # 让"几个参数各自合法、组合起来互相打架"在启动时就暴露，而不是等盘中拒单才发现。
+    from .budget_audit import audit_once
+    audit_once(s)
+    return s
 
 
 def reset_settings_cache() -> None:

@@ -28,6 +28,19 @@ from ..risk.engine import RiskEngine
 
 logger = logging.getLogger(__name__)
 
+#: 「回补」信号：这些买入是**把当日已卖出的份额买回来**，净敞口不增加
+#: （ETF/个股 T+0 卖出腿的买回平腿、尾盘强平买回、反向止损买回）。
+#: Gate-1 的「总仓位 vs Regime 上限」校验对它们不适用——否则会出现
+#: 「允许先卖后买，却不允许把卖掉的买回来」的自相矛盾：T 仓平不掉、尾盘
+#: 强平也补不回，底仓被风控一点点吃掉，与"底仓隔夜不动"的策略定义直接冲突。
+#: 注意：这不豁免 Regime 减仓本身，该减的照减；只是减完之后的回补不算新增敞口。
+#: （2026-09-17「规则统一」）
+BUYBACK_SIGNALS = frozenset({
+    "ETF_T0_BUYBACK", "ETF_T0_STOP_BUYBACK", "ETF_T0_FORCE_FLAT",
+    "STOCK_T0_BUYBACK", "STOCK_T0_STOP_BUYBACK", "STOCK_T0_FORCE_FLAT",
+    "STOP_LOSS",
+})
+
 
 @dataclass
 class ExecutionResult:
@@ -206,11 +219,15 @@ class ExecutionService:
         market = {"price": entry,
                   "limit_up": getattr(bar, "limit_up", None),
                   "limit_down": getattr(bar, "limit_down", None)}
+        # 回补性买入不算新增敞口（详见 BUYBACK_SIGNALS 注释），不参与
+        # 「总仓位 vs Regime 上限」校验，避免 T+0 卖出后买不回来的自相矛盾。
+        is_buyback = side is Side.BUY and signal in BUYBACK_SIGNALS
         verdict = self.risk.check_pre_trade(
             intent, portfolio=self.portfolio,
             regime=regime, killswitch=self.killswitch,
             instrument=instrument, market=market, sym_industry=sym_industry,
             daily_open_count=daily_open_count, high_corr_count=high_corr_count,
+            net_new_exposure=not is_buyback,
         )
         if not verdict.allow:
             return (ExecutionResult(False, sym, action, rejected_by="risk",
