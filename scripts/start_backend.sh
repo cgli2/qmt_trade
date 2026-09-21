@@ -12,12 +12,66 @@ LOG_DIR="logs"
 LOG="$LOG_DIR/backend.log"
 mkdir -p "$LOG_DIR"
 
-# 若端口已被占用（例如上次的后端没退），先把它结束掉再重启
-PID=$(netstat -ano 2>/dev/null | grep -E ":$PORT[[:space:]]" | grep LISTEN | awk '{print $5}' | head -1)
-if [ -n "$PID" ]; then
-  echo "端口 $PORT 被 PID $PID 占用，先终止旧进程..."
-  taskkill //PID "$PID" //F >/dev/null 2>&1 || true
-  sleep 2
+# ---- DuckDB 单进程锁：qmt.duckdb 同一时刻只允许一个进程持有 ----
+if [ -n "$QMT_RUNTIME_DB" ]; then
+  DB_FILE="${QMT_RUNTIME_DB//\\//}"
+else
+  DB_FILE="data/db/qmt.duckdb"
+fi
+db_locked() {                       # 打不开（被别的进程独占）→ 返回 0
+  [ -f "$DB_FILE" ] || return 1
+  ! "$PY" -c "import sys
+try:
+    open(sys.argv[1], 'rb').read(16)
+except OSError:
+    sys.exit(1)
+sys.exit(0)" "$DB_FILE" 2>/dev/null
+}
+
+# 若端口已被占用（例如上次的后端没退），连子进程树一起结束，
+# 否则 spawn 出来的回测计算进程会变成孤儿、继续抱着 DuckDB 不放。
+PIDS=$(netstat -ano 2>/dev/null | grep -E ":$PORT[[:space:]]" | grep LISTEN | awk '{print $5}' | sort -u)
+for OLD in $PIDS; do
+  echo "端口 $PORT 被 PID $OLD 占用，先终止旧进程（含子进程）..."
+  taskkill //PID "$OLD" //T //F >/dev/null 2>&1 || true
+done
+
+# 端口已让出但仍握着库的孤儿后端（上次启动失败/被强杀后残留）也要清掉
+ORPHANS=$("$PY" - <<'PYEOF' 2>/dev/null
+try:
+    import os, psutil
+except Exception:
+    raise SystemExit(0)
+me = os.getpid()
+for p in psutil.process_iter(["pid", "cmdline"]):
+    try:
+        if p.info["pid"] == me:
+            continue
+        if any("server.main:app" in a for a in (p.info["cmdline"] or [])):
+            print(p.info["pid"])
+    except Exception:
+        pass
+PYEOF
+)
+for OLD in $ORPHANS; do
+  echo "发现残留后端进程 PID $OLD（未监听 $PORT 但持有 DuckDB），终止..."
+  taskkill //PID "$OLD" //T //F >/dev/null 2>&1 || true
+done
+
+# 被强杀的进程释放几百 MB 的库文件句柄需要时间：等到锁真正放开再启
+if [ -n "$PIDS$ORPHANS" ] || db_locked; then
+  WAIT=0
+  while db_locked && [ "$WAIT" -lt 30 ]; do
+    sleep 1
+    WAIT=$((WAIT + 1))
+  done
+  if db_locked; then
+    echo "错误: $DB_FILE 仍被其他进程独占（DuckDB 只允许单进程持有），已等待 ${WAIT}s。"
+    echo "      请结束持有它的 python 进程后重试，例如 PowerShell 里："
+    echo "      Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object CommandLine -like '*server.main:app*' | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force }"
+    exit 1
+  fi
+  if [ "$WAIT" -gt 0 ]; then echo "数据库锁已释放（等待 ${WAIT}s）"; fi
 fi
 
 if [ "$1" = "--fg" ]; then

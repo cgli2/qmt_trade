@@ -16,7 +16,9 @@ def defaults(sid, settings):
     if sid in STANDALONE_STRATEGIES:
         from importlib import import_module
         names = {"tail_pick": "TailPickConfig", "limit_up": "LimitUpConfig", "second_board": "SecondBoardConfig",
-                 "dip_buy": "DipBuyConfig", "trend_buy": "TrendBuyConfig", "etf_t0": "ETFT0Config", "stock_t0": "StockT0Config"}
+                 "dip_buy": "DipBuyConfig", "trend_buy": "TrendBuyConfig", "etf_t0": "ETFT0Config", "stock_t0": "StockT0Config",
+                 "trend_breakout": "TrendBreakoutConfig",
+        "dividend_low_vol": "DividendLowVolConfig"}
         cls = getattr(import_module("qmt_trade.strategies." + sid), names[sid])
         if sid == "tail_pick":
             config = cls.from_settings(settings)

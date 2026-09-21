@@ -203,7 +203,7 @@ def resolve_min_percentile(sid: str | None, regime: Regime) -> float | None:
 # 添加新独立策略时在此登记 id 即可，绝不改动现有预设链路。
 STANDALONE_STRATEGIES: tuple[str, ...] = (
     "tail_pick", "limit_up", "second_board", "dip_buy", "trend_buy", "etf_t0",
-    "stock_t0",
+    "stock_t0", "trend_breakout", "dividend_low_vol",
 )
 
 _STANDALONE_META: dict[str, dict[str, str]] = {
@@ -226,6 +226,16 @@ _STANDALONE_META: dict[str, dict[str, str]] = {
     "trend_buy": dict(
         name="趋势类买点",
         summary="突破回踩确认 / 均线多头回调 / 上升趋势线回踩，止损+20%/+35% 止盈，持仓数天~数周。",
+    ),
+    "trend_breakout": dict(
+        name="趋势突破（N3 平台放量突破）",
+        summary="60日涨幅30%~100% + MA10>MA20>MA50 多头 + 40日平台振幅<25%，"
+                "放量突破平台上沿时买入，止损+20%/+35% 止盈，持仓数天~数周。",
+    ),
+    "dividend_low_vol": dict(
+        name="红利低波篮子（高股息+低波动）",
+        summary="估值因子（EPS/Price、BPS/Price）作红利代理 + 过去N日低波动，"
+                "综合分选前N只季度再平衡；A股近年最稳防守因子，易解释易落地。",
     ),
     "etf_t0": dict(
         name="ETF T+0 日内回转（底仓做T）",
@@ -263,6 +273,10 @@ def build_standalone_backtester(sid: str, settings, hub, *, initial_cash: float 
         "second_board": ("..strategies.second_board", "SecondBoardBacktester", "SecondBoardConfig", False),
         "dip_buy": ("..strategies.dip_buy", "DipBuyBacktester", "DipBuyConfig", False),
         "trend_buy": ("..strategies.trend_buy", "TrendBuyBacktester", "TrendBuyConfig", False),
+        "trend_breakout": ("..strategies.trend_breakout", "TrendBreakoutBacktester",
+                           "TrendBreakoutConfig", False),
+        "dividend_low_vol": ("..strategies.dividend_low_vol", "DividendLowVolBacktester",
+                             "DividendLowVolConfig", False),
         "etf_t0": ("..strategies.etf_t0", "ETFT0Backtester", "ETFT0Config", False),
         "stock_t0": ("..strategies.stock_t0", "StockT0Backtester", "StockT0Config", False),
     }
